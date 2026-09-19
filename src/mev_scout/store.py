@@ -6,6 +6,7 @@ from typing import Any
 
 from mev_scout.decode import Liquidation
 from mev_scout.dex import Pool
+from mev_scout.swaps import DecodedSwap
 
 
 class Store:
@@ -83,6 +84,39 @@ class Store:
                     token1 TEXT NOT NULL,
                     fee INTEGER NOT NULL,
                     PRIMARY KEY (chain_id, address)
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS swaps (
+                    chain_id INTEGER NOT NULL,
+                    dex TEXT NOT NULL,
+                    pool TEXT NOT NULL,
+                    block INTEGER NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    tx_hash TEXT NOT NULL,
+                    log_index INTEGER NOT NULL,
+                    sender TEXT NOT NULL,
+                    recipient TEXT NOT NULL,
+                    amount0 TEXT NOT NULL,
+                    amount1 TEXT NOT NULL,
+                    sqrt_price_x96 TEXT NOT NULL,
+                    liquidity TEXT NOT NULL,
+                    tick INTEGER NOT NULL,
+                    protocol_fees_token0 TEXT NOT NULL DEFAULT '0',
+                    protocol_fees_token1 TEXT NOT NULL DEFAULT '0',
+                    PRIMARY KEY (chain_id, tx_hash, log_index)
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pool_fetched_ranges (
+                    chain_id INTEGER NOT NULL,
+                    pool TEXT NOT NULL,
+                    from_block INTEGER NOT NULL,
+                    to_block INTEGER NOT NULL
                 )
                 """
             )
@@ -341,6 +375,153 @@ class Store:
             token1=row[4],
             fee=row[5],
         )
+
+    def insert_swaps(self, items: list[DecodedSwap]) -> None:
+        if not items:
+            return
+        rows = [
+            (
+                s.chain_id,
+                s.dex,
+                s.pool.lower(),
+                s.block,
+                s.timestamp,
+                s.tx_hash.lower(),
+                s.log_index,
+                s.sender.lower(),
+                s.recipient.lower(),
+                str(s.amount0),
+                str(s.amount1),
+                str(s.sqrt_price_x96),
+                str(s.liquidity),
+                s.tick,
+                str(s.protocol_fees_token0),
+                str(s.protocol_fees_token1),
+            )
+            for s in items
+        ]
+        with self.conn:
+            self.conn.executemany(
+                """
+                INSERT OR REPLACE INTO swaps (
+                    chain_id, dex, pool, block, timestamp, tx_hash, log_index,
+                    sender, recipient, amount0, amount1, sqrt_price_x96,
+                    liquidity, tick, protocol_fees_token0, protocol_fees_token1
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+
+    def get_swaps(
+        self,
+        chain_id: int,
+        from_block: int | None = None,
+        to_block: int | None = None,
+        pool: str | None = None,
+    ) -> list[DecodedSwap]:
+        query = (
+            "SELECT chain_id, dex, pool, block, timestamp, tx_hash, log_index, "
+            "sender, recipient, amount0, amount1, sqrt_price_x96, liquidity, "
+            "tick, protocol_fees_token0, protocol_fees_token1 "
+            "FROM swaps WHERE chain_id = ?"
+        )
+        params: list[Any] = [chain_id]
+        if from_block is not None:
+            query += " AND block >= ?"
+            params.append(from_block)
+        if to_block is not None:
+            query += " AND block <= ?"
+            params.append(to_block)
+        if pool is not None:
+            query += " AND pool = ?"
+            params.append(pool.lower())
+        query += " ORDER BY block ASC, log_index ASC"
+
+        cur = self.conn.cursor()
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        return [
+            DecodedSwap(
+                chain_id=r[0],
+                dex=r[1],
+                pool=r[2],
+                block=r[3],
+                timestamp=r[4],
+                tx_hash=r[5],
+                log_index=r[6],
+                sender=r[7],
+                recipient=r[8],
+                amount0=int(r[9]),
+                amount1=int(r[10]),
+                sqrt_price_x96=int(r[11]),
+                liquidity=int(r[12]),
+                tick=r[13],
+                protocol_fees_token0=int(r[14]),
+                protocol_fees_token1=int(r[15]),
+            )
+            for r in rows
+        ]
+
+    def insert_pool_range(self, chain_id: int, pool: str, from_block: int, to_block: int) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO pool_fetched_ranges (chain_id, pool, from_block, to_block) VALUES (?, ?, ?, ?)",
+                (chain_id, pool.lower(), from_block, to_block),
+            )
+
+    def last_fetched_pool_block(self, chain_id: int, pool: str) -> int | None:
+        row = self.conn.execute(
+            "SELECT MAX(to_block) FROM pool_fetched_ranges WHERE chain_id = ? AND pool = ?",
+            (chain_id, pool.lower()),
+        ).fetchone()
+        return row[0] if row and row[0] is not None else None
+
+    def pool_covered(self, chain_id: int, pool: str, from_block: int, to_block: int) -> list[tuple[int, int]]:
+        if from_block > to_block:
+            return []
+
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT from_block, to_block FROM pool_fetched_ranges WHERE chain_id = ? AND pool = ? ORDER BY from_block ASC",
+            (chain_id, pool.lower()),
+        )
+        raw_ranges = cur.fetchall()
+        if not raw_ranges:
+            return [(from_block, to_block)]
+
+        merged: list[tuple[int, int]] = []
+        for f, t in sorted(raw_ranges, key=lambda r: (r[0], r[1])):
+            if not merged:
+                merged.append((f, t))
+            else:
+                prev_f, prev_t = merged[-1]
+                if f <= prev_t + 1:
+                    merged[-1] = (prev_f, max(prev_t, t))
+                else:
+                    merged.append((f, t))
+
+        gaps: list[tuple[int, int]] = []
+        cursor = from_block
+
+        for start, end in merged:
+            if end < cursor:
+                continue
+            if start > cursor:
+                gaps.append((cursor, min(to_block, start - 1)))
+                if start > to_block:
+                    cursor = to_block + 1
+                    break
+                cursor = end + 1
+            else:
+                cursor = max(cursor, end + 1)
+
+            if cursor > to_block:
+                break
+
+        if cursor <= to_block:
+            gaps.append((cursor, to_block))
+
+        return gaps
 
     def close(self) -> None:
         self.conn.close()

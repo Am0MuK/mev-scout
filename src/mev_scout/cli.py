@@ -15,6 +15,8 @@ from mev_scout.explorer import (
     create_log_source,
     redact,
 )
+from mev_scout.arb_fetch import fetch_swaps
+from mev_scout.dex import discover_pools
 from mev_scout.fetch import fetch
 from mev_scout.report import CoverageError, generate_csv, generate_report
 from mev_scout.rpc import RpcClient, RpcError, _redact_url
@@ -86,6 +88,53 @@ def value_cmd(
             )
         unpriced = sum(1 for v in valued if v.unpriced)
         print(f"Valued {len(valued)} events on chain {chain_id} ({unpriced} unpriced)")
+    finally:
+        store.close()
+
+
+def arb_pools_cmd(chain_id: int, db_path: str = "data/scout.db") -> None:
+    if chain_id != 42161:
+        raise ConfigError(f"Arbitrage census currently only supports Arbitrum (42161), got {chain_id}")
+
+    rpc_env = f"MEVSCOUT_RPC_{chain_id}"
+    rpc_url = os.environ.get(rpc_env)
+    if not rpc_url:
+        raise ConfigError(f"{rpc_env} environment variable is required")
+
+    store = Store(db_path)
+    try:
+        with httpx.Client(timeout=30.0) as http:
+            rpc = RpcClient(url=rpc_url, http=http)
+            pools = discover_pools(chain_id=chain_id, rpc=rpc)
+            store.insert_pools(pools)
+            print(f"Discovered {len(pools)} pools on chain {chain_id}:")
+            for p in pools:
+                print(f"  [{p.dex}] {p.address}: token0={p.token0} token1={p.token1} fee={p.fee}")
+    finally:
+        store.close()
+
+
+def arb_fetch_cmd(chain_id: int, days: int = 90, db_path: str = "data/scout.db") -> None:
+    if chain_id != 42161:
+        raise ConfigError(f"Arbitrage census currently only supports Arbitrum (42161), got {chain_id}")
+
+    chain = CHAINS[chain_id]
+    api_key = os.environ.get("ETHERSCAN_API_KEY")
+    if not api_key:
+        raise ConfigError("ETHERSCAN_API_KEY environment variable is required")
+
+    rpc_env = f"MEVSCOUT_RPC_{chain_id}"
+    rpc_url = os.environ.get(rpc_env)
+    if not rpc_url:
+        raise ConfigError(f"{rpc_env} environment variable is required")
+
+    store = Store(db_path)
+    try:
+        with httpx.Client(timeout=30.0) as http:
+            explorer = create_log_source(chain=chain, http=http, api_key=api_key)
+            rpc = RpcClient(url=rpc_url, http=http)
+            fetch_swaps(chain_id=chain_id, days=days, explorer=explorer, rpc=rpc, store=store)
+            print(f"Fetched swaps for chain {chain_id} over {days} days")
     finally:
         store.close()
 
@@ -222,6 +271,17 @@ def main(argv=None) -> None:
     p_report.add_argument("--swap-cost", type=Decimal, default=DEFAULT_SWAP_COST, help="Swap cost fraction (default: 0.003)")
     p_report.add_argument("--flash-fee", type=Decimal, default=DEFAULT_FLASH_FEE, help="Flash-loan fee fraction (default: 0.0005)")
 
+    # arb-pools
+    p_arb_pools = subparsers.add_parser("arb-pools", help="Discover and store DEX pools for arbitrage")
+    p_arb_pools.add_argument("--chain", type=int, required=True, help="Chain ID (42161)")
+    p_arb_pools.add_argument("--db", default="data/scout.db", help="SQLite DB path (default: data/scout.db)")
+
+    # arb-fetch
+    p_arb_fetch = subparsers.add_parser("arb-fetch", help="Fetch swap logs for discovered DEX pools")
+    p_arb_fetch.add_argument("--chain", type=int, required=True, help="Chain ID (42161)")
+    p_arb_fetch.add_argument("--days", type=int, default=90, help="Days of history to fetch (default: 90)")
+    p_arb_fetch.add_argument("--db", default="data/scout.db", help="SQLite DB path (default: data/scout.db)")
+
     args = parser.parse_args(argv)
 
     try:
@@ -251,6 +311,14 @@ def main(argv=None) -> None:
                 flash_fee=args.flash_fee,
             )
             print(output)
+            sys.exit(0)
+
+        elif args.command == "arb-pools":
+            arb_pools_cmd(chain_id=args.chain, db_path=args.db)
+            sys.exit(0)
+
+        elif args.command == "arb-fetch":
+            arb_fetch_cmd(chain_id=args.chain, days=args.days, db_path=args.db)
             sys.exit(0)
 
     except Exception as exc:
