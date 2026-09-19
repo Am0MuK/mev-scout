@@ -92,8 +92,8 @@ class EtherscanClient(LogSource):
 
             try:
                 resp = self.http.get(self.base_url, params=full_params)
-            except httpx.TimeoutException as exc:
-                last_error = ExplorerError(f"Etherscan request timed out: {self._clean(exc)}")
+            except httpx.TransportError as exc:  # timeouts, dropped connections, resets
+                last_error = ExplorerError(f"Etherscan network error, retrying: {self._clean(exc)}")
                 continue
             except Exception as exc:
                 raise ExplorerError(f"Etherscan request failed: {self._clean(exc)}") from exc
@@ -261,8 +261,8 @@ class BlockscoutClient(LogSource):
 
             try:
                 resp = self.http.get(self.base_url, params=full_params, headers=headers)
-            except httpx.TimeoutException as exc:
-                last_error = ExplorerError(f"Blockscout request timed out: {self._clean(exc)}")
+            except httpx.TransportError as exc:  # timeouts, dropped connections, resets
+                last_error = ExplorerError(f"Blockscout network error, retrying: {self._clean(exc)}")
                 continue
             except Exception as exc:
                 raise ExplorerError(f"Blockscout request failed: {self._clean(exc)}") from exc
