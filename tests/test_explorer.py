@@ -256,3 +256,18 @@ def test_rows_not_in_ascending_block_order_are_an_error():
     ]
     with pytest.raises(ExplorerError, match="order"):
         _client([rows]).get_logs(1, "0xpool", "0xtopic", 10, 20)
+
+
+def test_dropped_connection_is_retried():
+    # Live: "Server disconnected without sending a response" aborted a 90-day fetch.
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.", request=request)
+        return httpx.Response(200, json={"status": "0", "message": "No records found", "result": []})
+
+    client = EtherscanClient(api_key="KEY", http=httpx.Client(transport=httpx.MockTransport(handler)), sleep=lambda s: None)
+    assert client.get_logs(1, "0xpool", "0xtopic", 1, 10) == []
+    assert calls["n"] == 3
