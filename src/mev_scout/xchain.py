@@ -8,6 +8,7 @@ from decimal import Decimal
 from typing import Any
 
 from mev_scout.dex import TokenConfig
+from mev_scout.rpc import ContractCallError, RpcClient
 
 # Selectors
 UNISWAP_GET_POOL_SELECTOR = "0x1698ee82"
@@ -258,3 +259,155 @@ def decode_quote(adapter_type: str, data_hex: str) -> tuple[int, int]:
         return amount_out, 0
     else:
         raise ValueError(f"Unknown adapter_type: {adapter_type}")
+
+
+def is_shallow_quote(amount_in_1x: int, quote_1x: int, quote_10x: int) -> bool:
+    """Check whether a pool is shallow.
+
+    A chosen pool must quote 10x the size at no worse than 2% below the 1x price.
+    Returns True if shallow (should be skipped), False if deep enough.
+    """
+    if amount_in_1x <= 0 or quote_1x <= 0 or quote_10x <= 0:
+        return True
+
+    price_1x = Decimal(quote_1x) / Decimal(amount_in_1x)
+    price_10x = Decimal(quote_10x) / Decimal(10 * amount_in_1x)
+
+    # "at no worse than 2% below the 1x price"
+    min_allowed_price = price_1x * Decimal("0.98")
+    if price_10x < min_allowed_price:
+        return True
+    return False
+
+
+def _execute_batch_or_single(
+    rpc: RpcClient, calls: list[tuple[str, str, str | int]]
+) -> list[Any]:
+    if not calls:
+        return []
+    batch_fn = getattr(rpc, "batch_call", None) if hasattr(type(rpc), "batch_call") else None
+    if callable(batch_fn):
+        return batch_fn(calls)
+    results = []
+    for to, data, block in calls:
+        try:
+            results.append(rpc.call(to, data, block))
+        except ContractCallError as exc:
+            results.append(exc)
+    return results
+
+
+def discover_xchain_pools(
+    chain_id: int,
+    rpc: RpcClient,
+    venues: list[VenueConfig] | None = None,
+) -> list[XChainPool]:
+    """Discover pools on `chain_id` across all venues for WETH/USDC.
+
+    Verifies token0() and fee/tickSpacing on each pool.
+    """
+    if chain_id not in XCHAIN_TOKENS:
+        raise ValueError(f"Chain {chain_id} not supported for cross-chain")
+
+    if venues is None:
+        venues = [v for v in XCHAIN_VENUES if v.chain_id == chain_id]
+
+    tok_weth = XCHAIN_TOKENS[chain_id]["WETH"].address.lower()
+    tok_usdc = XCHAIN_TOKENS[chain_id]["USDC"].address.lower()
+    expected_token0 = min(tok_weth, tok_usdc)
+    expected_token1 = max(tok_weth, tok_usdc)
+
+    candidates = []
+    calls = []
+    for v in venues:
+        for key in v.pool_keys:
+            calldata = encode_get_pool(v.adapter_type, tok_weth, tok_usdc, key)
+            candidates.append((v, key))
+            calls.append((v.factory, calldata, "latest"))
+
+    results = _execute_batch_or_single(rpc, calls)
+
+    discovered_candidates = []
+    verification_calls = []
+
+    for (v, key), res in zip(candidates, results):
+        if isinstance(res, ContractCallError):
+            continue
+        if isinstance(res, Exception):
+            raise res
+        if not isinstance(res, str):
+            continue
+        clean_res = res.removeprefix("0x").removeprefix("0X")
+        if len(clean_res) < 40:
+            continue
+        addr = "0x" + clean_res[-40:].lower()
+        if int(clean_res, 16) == 0:
+            continue
+
+        discovered_candidates.append((v, key, addr))
+        verification_calls.append((addr, TOKEN0_SELECTOR, "latest"))
+        if v.adapter_type == "uniswap_v3":
+            verification_calls.append((addr, FEE_SELECTOR, "latest"))
+        elif v.adapter_type == "slipstream":
+            verification_calls.append((addr, TICK_SPACING_SELECTOR, "latest"))
+
+    if not discovered_candidates:
+        return []
+
+    verify_results = _execute_batch_or_single(rpc, verification_calls)
+
+    pools = []
+    res_idx = 0
+    for v, key, addr in discovered_candidates:
+        tok0_res = verify_results[res_idx]
+        res_idx += 1
+        if isinstance(tok0_res, Exception):
+            raise ValueError(f"Failed to query token0 for pool {addr}: {tok0_res}") from tok0_res
+        clean_tok0 = tok0_res.removeprefix("0x").removeprefix("0X")
+        actual_token0 = "0x" + clean_tok0[-40:].lower()
+        if actual_token0 != expected_token0:
+            raise ValueError(
+                f"Pool verification failed for {addr}: "
+                f"token0 mismatch (expected {expected_token0}, got {actual_token0})"
+            )
+
+        if v.adapter_type == "uniswap_v3":
+            fee_res = verify_results[res_idx]
+            res_idx += 1
+            if isinstance(fee_res, Exception):
+                raise ValueError(f"Failed to query fee for pool {addr}: {fee_res}") from fee_res
+            actual_fee = int(fee_res.removeprefix("0x").removeprefix("0X"), 16)
+            if actual_fee != int(key):
+                raise ValueError(
+                    f"Pool verification failed for {addr}: "
+                    f"fee mismatch (expected {key}, got {actual_fee})"
+                )
+        elif v.adapter_type == "slipstream":
+            ts_res = verify_results[res_idx]
+            res_idx += 1
+            if isinstance(ts_res, Exception):
+                raise ValueError(f"Failed to query tickSpacing for pool {addr}: {ts_res}") from ts_res
+            clean_ts = ts_res.removeprefix("0x").removeprefix("0X")
+            raw_ts = int(clean_ts, 16)
+            actual_ts = raw_ts - (1 << 256) if raw_ts >= (1 << 255) else raw_ts
+            if actual_ts != int(key):
+                raise ValueError(
+                    f"Pool verification failed for {addr}: "
+                    f"tickSpacing mismatch (expected {key}, got {actual_ts})"
+                )
+
+        pools.append(
+            XChainPool(
+                chain_id=chain_id,
+                venue_name=v.name,
+                address=addr,
+                token0=expected_token0,
+                token1=expected_token1,
+                pool_key=key,
+                adapter_type=v.adapter_type,
+                factory=v.factory,
+                quoter=v.quoter,
+            )
+        )
+
+    return pools

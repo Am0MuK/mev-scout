@@ -203,3 +203,179 @@ def test_classic_aerodrome_adapter_encoding_and_decoding():
     dec_out, dec_gas = decode_quote("aerodrome_classic", res_hex)
     assert dec_out == amt_out
     assert dec_gas == 0
+
+
+def test_shallow_check_logic():
+    from mev_scout.xchain import is_shallow_quote
+
+    # 1 WETH = 10**18, 10 WETH = 10 * 10**18
+    # 1x price = 2600 USDC
+    amt_in_1x = 10**18
+    quote_1x = 2600 * 10**6
+
+    # 10x quote = 25900 USDC (price 2590, drop = 0.38% <= 2%) -> NOT shallow
+    assert is_shallow_quote(amt_in_1x, quote_1x, 25900 * 10**6) is False
+
+    # 10x quote = 25480 USDC (price 2548, drop = exactly 2.0%) -> NOT shallow
+    assert is_shallow_quote(amt_in_1x, quote_1x, 25480 * 10**6) is False
+
+    # 10x quote = 25479 USDC (drop > 2%) -> IS shallow
+    assert is_shallow_quote(amt_in_1x, quote_1x, 25479 * 10**6) is True
+
+    # Aerodrome tickSpacing 200 real example: 1 WETH -> 546, 10 WETH -> 546
+    assert is_shallow_quote(10**18, 546 * 10**6, 546 * 10**6) is True
+
+    # Reverted / zero quotes are treated as shallow
+    assert is_shallow_quote(10**18, 0, 10**6) is True
+    assert is_shallow_quote(10**18, 10**6, 0) is True
+
+
+def test_discover_xchain_pools_base():
+    from mev_scout.xchain import XChainPool, discover_xchain_pools
+    from mev_scout.rpc import ContractCallError
+
+    base_weth = XCHAIN_TOKENS[8453]["WETH"].address.lower()
+    base_usdc = XCHAIN_TOKENS[8453]["USDC"].address.lower()
+    token0 = min(base_weth, base_usdc)
+
+    pool_uni = "0xb4cb800922cc596700c50d4f3b64c12ea85fa8ce"
+    pool_slip = "0xb2cc224c1c9fe33e329736a701460002d2c1130e"
+    pool_classic = "0x42000000000000000000000000000000000000aa"
+
+    # Fake RPC responses
+    uni_factory = "0x33128a8fc17869897dce68ed026d694621f6fdfd"
+    slip_factory = "0x5e7bb104d84c7cb9b682aac2f3d509f5f406809a"
+    classic_factory = "0x420dd381b31aef6683db6b902084cb0ffece40da"
+
+    # Call mappings
+    call_responses = {
+        # Uni V3 fee 100 on Base
+        (uni_factory.lower(), encode_get_pool("uniswap_v3", base_weth, base_usdc, 100).lower(), "latest"): (
+            "0x" + "0" * 24 + pool_uni[2:]
+        ),
+        (pool_uni.lower(), "0x0dfe1681", "latest"): "0x" + "0" * 24 + token0[2:],
+        (pool_uni.lower(), "0xddca3f43", "latest"): "0x" + hex(100)[2:].rjust(64, "0"),
+
+        # Slipstream 1 ts 100 on Base
+        (slip_factory.lower(), encode_get_pool("slipstream", base_weth, base_usdc, 100).lower(), "latest"): (
+            "0x" + "0" * 24 + pool_slip[2:]
+        ),
+        (pool_slip.lower(), "0x0dfe1681", "latest"): "0x" + "0" * 24 + token0[2:],
+        (pool_slip.lower(), "0xd0c93a7c", "latest"): "0x" + hex(100)[2:].rjust(64, "0"),
+
+        # Classic Aerodrome volatile on Base
+        (classic_factory.lower(), encode_get_pool("aerodrome_classic", base_weth, base_usdc, False).lower(), "latest"): (
+            "0x" + "0" * 24 + pool_classic[2:]
+        ),
+        (pool_classic.lower(), "0x0dfe1681", "latest"): "0x" + "0" * 24 + token0[2:],
+    }
+
+    class FakeRpc:
+        def call(self, to: str, data: str, block: str | int = "latest") -> str:
+            key = (to.lower(), data.lower(), str(block).lower())
+            if key in call_responses:
+                return call_responses[key]
+            # Other getPool calls return zero address (no pool)
+            if data.startswith("0x1698ee82") or data.startswith("0x28af8d0b") or data.startswith("0x79bc57d5"):
+                return "0x" + "0" * 64
+            raise ContractCallError(f"No fake response for {to} {data}")
+
+        def batch_call(self, calls: list[tuple[str, str, str | int]]) -> list[str]:
+            res = []
+            for c in calls:
+                try:
+                    res.append(self.call(c[0], c[1], c[2]))
+                except ContractCallError as exc:
+                    res.append(exc)
+            return res
+
+    rpc = FakeRpc()
+    discovered = discover_xchain_pools(8453, rpc)
+
+    assert len(discovered) == 3
+    by_addr = {p.address.lower(): p for p in discovered}
+    assert pool_uni.lower() in by_addr
+    assert by_addr[pool_uni.lower()].adapter_type == "uniswap_v3"
+    assert by_addr[pool_uni.lower()].pool_key == 100
+
+    assert pool_slip.lower() in by_addr
+    assert by_addr[pool_slip.lower()].adapter_type == "slipstream"
+    assert by_addr[pool_slip.lower()].pool_key == 100
+
+    assert pool_classic.lower() in by_addr
+    assert by_addr[pool_classic.lower()].adapter_type == "aerodrome_classic"
+    assert by_addr[pool_classic.lower()].pool_key is False
+
+
+def test_discover_xchain_pools_verification_mismatch_raises():
+    from mev_scout.xchain import discover_xchain_pools
+    from mev_scout.rpc import ContractCallError
+
+    base_weth = XCHAIN_TOKENS[8453]["WETH"].address.lower()
+    base_usdc = XCHAIN_TOKENS[8453]["USDC"].address.lower()
+    uni_factory = "0x33128a8fc17869897dce68ed026d694621f6fdfd"
+    pool_addr = "0xb4cb800922cc596700c50d4f3b64c12ea85fa8ce"
+
+    call_responses = {
+        (uni_factory.lower(), encode_get_pool("uniswap_v3", base_weth, base_usdc, 100).lower(), "latest"): (
+            "0x" + "0" * 24 + pool_addr[2:]
+        ),
+        # Wrong token0
+        (pool_addr.lower(), "0x0dfe1681", "latest"): "0x" + "0" * 24 + "11" * 20,
+        (pool_addr.lower(), "0xddca3f43", "latest"): "0x" + hex(100)[2:].rjust(64, "0"),
+    }
+
+    class FakeRpc:
+        def call(self, to: str, data: str, block: str | int = "latest") -> str:
+            key = (to.lower(), data.lower(), str(block).lower())
+            if key in call_responses:
+                return call_responses[key]
+            if data.startswith("0x1698ee82") or data.startswith("0x28af8d0b") or data.startswith("0x79bc57d5"):
+                return "0x" + "0" * 64
+            raise ContractCallError(f"No fake response for {to} {data}")
+
+        def batch_call(self, calls):
+            return [self.call(c[0], c[1], c[2]) for c in calls]
+
+    rpc = FakeRpc()
+    with pytest.raises(ValueError, match="token0 mismatch"):
+        discover_xchain_pools(8453, rpc)
+
+
+def test_store_xchain_pools():
+    from mev_scout.store import Store
+    from mev_scout.xchain import XChainPool
+
+    store = Store(":memory:")
+    pool1 = XChainPool(
+        chain_id=8453,
+        venue_name="uniswap_v3",
+        address="0xb4cb800922cc596700c50d4f3b64c12ea85fa8ce",
+        token0="0x4200000000000000000000000000000000000006",
+        token1="0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        pool_key=100,
+        adapter_type="uniswap_v3",
+        factory="0x33128a8fc17869897dce68ed026d694621f6fdfd",
+        quoter="0x3d4e44eb1374240ce5f1b871ab261cd16335b76a",
+    )
+    pool2 = XChainPool(
+        chain_id=8453,
+        venue_name="slipstream_1",
+        address="0xb2cc224c1c9fe33e329736a701460002d2c1130e",
+        token0="0x4200000000000000000000000000000000000006",
+        token1="0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        pool_key=100,
+        adapter_type="slipstream",
+        factory="0x5e7bb104d84c7cb9b682aac2f3d509f5f406809a",
+        quoter="0x254cf9e1e6e233aa1ac962cb9b05b2cfeaae15b0",
+    )
+
+    store.insert_xchain_pools([pool1, pool2])
+    retrieved = store.get_xchain_pools(8453)
+    assert len(retrieved) == 2
+    by_addr = {p.address.lower(): p for p in retrieved}
+    assert pool1.address.lower() in by_addr
+    assert by_addr[pool1.address.lower()].adapter_type == "uniswap_v3"
+    assert by_addr[pool1.address.lower()].pool_key == 100
+    assert pool2.address.lower() in by_addr
+    assert by_addr[pool2.address.lower()].adapter_type == "slipstream"

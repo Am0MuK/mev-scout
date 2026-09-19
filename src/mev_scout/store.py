@@ -162,6 +162,22 @@ class Store:
                 )
                 """
             )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS xchain_pools (
+                    chain_id INTEGER NOT NULL,
+                    venue_name TEXT NOT NULL,
+                    address TEXT NOT NULL,
+                    token0 TEXT NOT NULL,
+                    token1 TEXT NOT NULL,
+                    pool_key TEXT NOT NULL,
+                    adapter_type TEXT NOT NULL,
+                    factory TEXT NOT NULL,
+                    quoter TEXT,
+                    PRIMARY KEY (chain_id, address)
+                )
+                """
+            )
 
     def insert_liquidations(self, items: list[Liquidation]) -> None:
         if not items:
@@ -724,6 +740,72 @@ class Store:
             to_block=row[5],
             unpriced_blocks=row[6],
         )
+
+    def insert_xchain_pools(self, pools: list[Any]) -> None:
+        if not pools:
+            return
+        rows = [
+            (
+                p.chain_id,
+                p.venue_name,
+                p.address.lower(),
+                p.token0.lower(),
+                p.token1.lower(),
+                str(p.pool_key),
+                p.adapter_type,
+                p.factory.lower(),
+                p.quoter.lower() if p.quoter else None,
+            )
+            for p in pools
+        ]
+        with self.conn:
+            self.conn.executemany(
+                """
+                INSERT OR REPLACE INTO xchain_pools (
+                    chain_id, venue_name, address, token0, token1, pool_key,
+                    adapter_type, factory, quoter
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+
+    def get_xchain_pools(self, chain_id: int) -> list[Any]:
+        from mev_scout.xchain import XChainPool
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT chain_id, venue_name, address, token0, token1, pool_key,
+                   adapter_type, factory, quoter
+            FROM xchain_pools WHERE chain_id = ?
+            ORDER BY venue_name ASC, address ASC
+            """,
+            (chain_id,),
+        )
+        rows = cur.fetchall()
+        result = []
+        for r in rows:
+            raw_key = r[5]
+            if raw_key in ("True", "False"):
+                pool_key = (raw_key == "True")
+            else:
+                try:
+                    pool_key = int(raw_key)
+                except ValueError:
+                    pool_key = raw_key
+            result.append(
+                XChainPool(
+                    chain_id=r[0],
+                    venue_name=r[1],
+                    address=r[2],
+                    token0=r[3],
+                    token1=r[4],
+                    pool_key=pool_key,
+                    adapter_type=r[6],
+                    factory=r[7],
+                    quoter=r[8],
+                )
+            )
+        return result
 
     def close(self) -> None:
         self.conn.close()
