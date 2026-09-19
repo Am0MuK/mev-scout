@@ -1158,7 +1158,7 @@ def test_run_xchain_sample_and_resume(tmp_path):
     # No new RPC calls made because all moments were already completed!
     call_counts_after = {cid: r.call_count for cid, r in rpcs.items()}
     assert call_counts_before == call_counts_after
-    assert prog_io_2.getvalue() == ""
+    assert "Sampled" not in prog_io_2.getvalue()  # only the final unpriced-pairs summary
 
     store.close()
 

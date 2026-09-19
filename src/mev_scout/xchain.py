@@ -188,17 +188,7 @@ DEFAULT_REBALANCE_FIXED_USD = Decimal("1.00")
 OVERHEAD_GAS = 100_000
 XCHAIN_SIZES_USD = (Decimal("1000"), Decimal("10000"), Decimal("50000"))
 
-CANONICAL_DEEPEST_POOLS = {
-    42161: "0xc6962004f452be9203591991d15f6b388e09e8d0",  # Uniswap V3 fee 500
-    8453: "0xb4cb800922cc596700c50d4f3b64c12ea85fa8ce",   # Uniswap V3 fee 100
-    10: "0xc1738d90c0f3056157f44d8525b642674e2d2740",     # Uniswap V3 fee 3000
-}
 
-DEEPEST_POOL_FEES = {
-    42161: 500,
-    8453: 100,
-    10: 3000,
-}
 
 
 @dataclass(frozen=True)
@@ -1187,6 +1177,21 @@ def parse_dense_ranges(dense_ranges: list[str] | None) -> list[tuple[int, int]]:
     return res
 
 
+def _weth_price_from_quotes(
+    rpc: RpcClient,
+    chain_id: int,
+    block: int,
+    pools: list[XChainPool],
+    cache: dict[tuple[int, int], Decimal | None],
+) -> Decimal | None:
+    """USDC per WETH implied by the best executable 1,000 USDC buy at `block`."""
+    key = (chain_id, block)
+    if key not in cache:
+        q = get_best_buy_quote(rpc=rpc, chain_id=chain_id, block=block, pools=pools, size_usd=Decimal("1000"))
+        cache[key] = (Decimal("1000") / (Decimal(q.amount_out) / Decimal(10**18))) if q and q.amount_out > 0 else None
+    return cache[key]
+
+
 def run_xchain_sample(
     rpcs: dict[int, RpcClient],
     store: Any,
@@ -1221,6 +1226,7 @@ def run_xchain_sample(
     grid = generate_time_grid(start_ts, end_ts, step_s=every_min * 60, dense_ranges=dense)
 
     completed = store.get_completed_xchain_moments()
+    unpriced_pairs = 0
     chain_pairs = [(42161, 8453), (42161, 10), (8453, 10)]
 
     for idx, moment in enumerate(grid):
@@ -1243,125 +1249,114 @@ def run_xchain_sample(
             continue
 
         moment_opps: list[XChainOpportunity] = []
+        price_cache: dict[tuple[int, int], Decimal | None] = {}
         for chain_a, chain_b in chain_pairs:
             block_a = chain_blocks[chain_a][0]
             block_b = chain_blocks[chain_b][0]
 
-            try:
-                slot0_a = rpcs[chain_a].call(CANONICAL_DEEPEST_POOLS[chain_a], SLOT0_SELECTOR, block_a)
-                price_a = decode_slot0_weth_usdc_price(chain_a, slot0_a)
-            except ContractCallError:
+            # WETH/USD per chain from the best real executable quote at that block.
+            # The former hardcoded "deepest pools" for Base and Optimism were invented
+            # addresses (completed from truncated prefixes); every call returned empty
+            # and every chain pair was skipped silently.
+            price_a = _weth_price_from_quotes(rpcs[chain_a], chain_a, block_a, pools[chain_a], price_cache)
+            price_b = _weth_price_from_quotes(rpcs[chain_b], chain_b, block_b, pools[chain_b], price_cache)
+            if price_a is None or price_b is None:
+                unpriced_pairs += 1
                 continue
 
-            try:
-                slot0_b = rpcs[chain_b].call(CANONICAL_DEEPEST_POOLS[chain_b], SLOT0_SELECTOR, block_b)
-                price_b = decode_slot0_weth_usdc_price(chain_b, slot0_b)
-            except ContractCallError:
-                continue
+            # No mid-price prefilter: the fixed "deepest" pools (Optimism Uniswap 0.3%)
+            # made the threshold ~0.4% and discarded every gap without recording it.
+            # Both directions are evaluated from the best executable quotes and every
+            # evaluation is stored, profitable or not.
+            price_of = {chain_a: price_a, chain_b: price_b}
+            for c_buy, c_sell in ((chain_a, chain_b), (chain_b, chain_a)):
+                p_buy, p_sell = price_of[c_buy], price_of[c_sell]
+                b_buy = chain_blocks[c_buy][0]
+                b_sell = chain_blocks[c_sell][0]
 
-            passes_pref, _, _ = check_prefilter(
-                price_a,
-                DEEPEST_POOL_FEES[chain_a],
-                price_b,
-                DEEPEST_POOL_FEES[chain_b],
-                rebalance_pct=rebalance_pct,
-            )
-            if not passes_pref:
-                continue
+                for size in XCHAIN_SIZES_USD:
+                    opp = evaluate_cross_chain_gap(
+                        moment=moment,
+                        chain_buy=c_buy,
+                        chain_sell=c_sell,
+                        block_buy=b_buy,
+                        block_sell=b_sell,
+                        rpc_buy=rpcs[c_buy],
+                        rpc_sell=rpcs[c_sell],
+                        pools_buy=pools[c_buy],
+                        pools_sell=pools[c_sell],
+                        size_usd=size,
+                        mid_price_buy=p_buy,
+                        mid_price_sell=p_sell,
+                        rebalance_pct=rebalance_pct,
+                        rebalance_fixed_usd=rebalance_fixed_usd,
+                    )
+                    if opp is not None:
+                        if opp.is_opportunity:
+                            # 1. next blocks on both chains
+                            opp_next = evaluate_cross_chain_gap(
+                                moment=moment,
+                                chain_buy=c_buy,
+                                chain_sell=c_sell,
+                                block_buy=b_buy + 1,
+                                block_sell=b_sell + 1,
+                                rpc_buy=rpcs[c_buy],
+                                rpc_sell=rpcs[c_sell],
+                                pools_buy=pools[c_buy],
+                                pools_sell=pools[c_sell],
+                                size_usd=size,
+                                mid_price_buy=p_buy,
+                                mid_price_sell=p_sell,
+                                rebalance_pct=rebalance_pct,
+                                rebalance_fixed_usd=rebalance_fixed_usd,
+                            )
+                            opp.persisted_next_block = (
+                                opp_next is not None and opp_next.is_opportunity
+                            )
 
-            if price_a <= price_b:
-                c_buy, c_sell = chain_a, chain_b
-                p_buy, p_sell = price_a, price_b
-            else:
-                c_buy, c_sell = chain_b, chain_a
-                p_buy, p_sell = price_b, price_a
+                            # 2. +1 min
+                            b_buy_1m, _ = find_block_by_timestamp(c_buy, moment + 60, rpcs[c_buy], store=store)
+                            b_sell_1m, _ = find_block_by_timestamp(c_sell, moment + 60, rpcs[c_sell], store=store)
+                            opp_1m = evaluate_cross_chain_gap(
+                                moment=moment,
+                                chain_buy=c_buy,
+                                chain_sell=c_sell,
+                                block_buy=b_buy_1m,
+                                block_sell=b_sell_1m,
+                                rpc_buy=rpcs[c_buy],
+                                rpc_sell=rpcs[c_sell],
+                                pools_buy=pools[c_buy],
+                                pools_sell=pools[c_sell],
+                                size_usd=size,
+                                mid_price_buy=p_buy,
+                                mid_price_sell=p_sell,
+                                rebalance_pct=rebalance_pct,
+                                rebalance_fixed_usd=rebalance_fixed_usd,
+                            )
+                            opp.persisted_1m = opp_1m is not None and opp_1m.is_opportunity
 
-            b_buy = chain_blocks[c_buy][0]
-            b_sell = chain_blocks[c_sell][0]
+                            # 3. +5 min
+                            b_buy_5m, _ = find_block_by_timestamp(c_buy, moment + 300, rpcs[c_buy], store=store)
+                            b_sell_5m, _ = find_block_by_timestamp(c_sell, moment + 300, rpcs[c_sell], store=store)
+                            opp_5m = evaluate_cross_chain_gap(
+                                moment=moment,
+                                chain_buy=c_buy,
+                                chain_sell=c_sell,
+                                block_buy=b_buy_5m,
+                                block_sell=b_sell_5m,
+                                rpc_buy=rpcs[c_buy],
+                                rpc_sell=rpcs[c_sell],
+                                pools_buy=pools[c_buy],
+                                pools_sell=pools[c_sell],
+                                size_usd=size,
+                                mid_price_buy=p_buy,
+                                mid_price_sell=p_sell,
+                                rebalance_pct=rebalance_pct,
+                                rebalance_fixed_usd=rebalance_fixed_usd,
+                            )
+                            opp.persisted_5m = opp_5m is not None and opp_5m.is_opportunity
 
-            for size in XCHAIN_SIZES_USD:
-                opp = evaluate_cross_chain_gap(
-                    moment=moment,
-                    chain_buy=c_buy,
-                    chain_sell=c_sell,
-                    block_buy=b_buy,
-                    block_sell=b_sell,
-                    rpc_buy=rpcs[c_buy],
-                    rpc_sell=rpcs[c_sell],
-                    pools_buy=pools[c_buy],
-                    pools_sell=pools[c_sell],
-                    size_usd=size,
-                    mid_price_buy=p_buy,
-                    mid_price_sell=p_sell,
-                    rebalance_pct=rebalance_pct,
-                    rebalance_fixed_usd=rebalance_fixed_usd,
-                )
-                if opp is not None:
-                    if opp.is_opportunity:
-                        # 1. next blocks on both chains
-                        opp_next = evaluate_cross_chain_gap(
-                            moment=moment,
-                            chain_buy=c_buy,
-                            chain_sell=c_sell,
-                            block_buy=b_buy + 1,
-                            block_sell=b_sell + 1,
-                            rpc_buy=rpcs[c_buy],
-                            rpc_sell=rpcs[c_sell],
-                            pools_buy=pools[c_buy],
-                            pools_sell=pools[c_sell],
-                            size_usd=size,
-                            mid_price_buy=p_buy,
-                            mid_price_sell=p_sell,
-                            rebalance_pct=rebalance_pct,
-                            rebalance_fixed_usd=rebalance_fixed_usd,
-                        )
-                        opp.persisted_next_block = (
-                            opp_next is not None and opp_next.is_opportunity
-                        )
-
-                        # 2. +1 min
-                        b_buy_1m, _ = find_block_by_timestamp(c_buy, moment + 60, rpcs[c_buy], store=store)
-                        b_sell_1m, _ = find_block_by_timestamp(c_sell, moment + 60, rpcs[c_sell], store=store)
-                        opp_1m = evaluate_cross_chain_gap(
-                            moment=moment,
-                            chain_buy=c_buy,
-                            chain_sell=c_sell,
-                            block_buy=b_buy_1m,
-                            block_sell=b_sell_1m,
-                            rpc_buy=rpcs[c_buy],
-                            rpc_sell=rpcs[c_sell],
-                            pools_buy=pools[c_buy],
-                            pools_sell=pools[c_sell],
-                            size_usd=size,
-                            mid_price_buy=p_buy,
-                            mid_price_sell=p_sell,
-                            rebalance_pct=rebalance_pct,
-                            rebalance_fixed_usd=rebalance_fixed_usd,
-                        )
-                        opp.persisted_1m = opp_1m is not None and opp_1m.is_opportunity
-
-                        # 3. +5 min
-                        b_buy_5m, _ = find_block_by_timestamp(c_buy, moment + 300, rpcs[c_buy], store=store)
-                        b_sell_5m, _ = find_block_by_timestamp(c_sell, moment + 300, rpcs[c_sell], store=store)
-                        opp_5m = evaluate_cross_chain_gap(
-                            moment=moment,
-                            chain_buy=c_buy,
-                            chain_sell=c_sell,
-                            block_buy=b_buy_5m,
-                            block_sell=b_sell_5m,
-                            rpc_buy=rpcs[c_buy],
-                            rpc_sell=rpcs[c_sell],
-                            pools_buy=pools[c_buy],
-                            pools_sell=pools[c_sell],
-                            size_usd=size,
-                            mid_price_buy=p_buy,
-                            mid_price_sell=p_sell,
-                            rebalance_pct=rebalance_pct,
-                            rebalance_fixed_usd=rebalance_fixed_usd,
-                        )
-                        opp.persisted_5m = opp_5m is not None and opp_5m.is_opportunity
-
-                    moment_opps.append(opp)
+                        moment_opps.append(opp)
 
         if moment_opps:
             store.insert_xchain_opportunities(moment_opps)
@@ -1373,3 +1368,7 @@ def run_xchain_sample(
 
 
 
+
+    if progress_stream is not None:
+        progress_stream.write(f"Chain pairs skipped without a WETH price: {unpriced_pairs}\n")
+        progress_stream.flush()
