@@ -3,7 +3,7 @@
 import time
 from mev_scout.chains import CHAINS, ConfigError
 from mev_scout.decode import LIQUIDATION_TOPIC0, decode_log
-from mev_scout.explorer import EtherscanClient
+from mev_scout.explorer import LogSource
 from mev_scout.rpc import RpcClient
 from mev_scout.store import Store
 
@@ -38,7 +38,7 @@ def decode_address_array(data_hex: str) -> list[str]:
 def fetch(
     chain_id: int,
     days: int,
-    explorer: EtherscanClient,
+    explorer: LogSource,
     rpc: RpcClient,
     store: Store,
     now: int | None = None,

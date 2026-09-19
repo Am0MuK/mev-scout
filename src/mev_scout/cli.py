@@ -8,7 +8,13 @@ import time
 import httpx
 
 from mev_scout.chains import CHAINS, ConfigError
-from mev_scout.explorer import EtherscanClient, ExplorerError, redact
+from mev_scout.explorer import (
+    BlockscoutClient,
+    EtherscanClient,
+    ExplorerError,
+    create_log_source,
+    redact,
+)
 from mev_scout.fetch import fetch
 from mev_scout.report import CoverageError, generate_csv, generate_report
 from mev_scout.rpc import RpcClient, RpcError, _redact_url
@@ -29,8 +35,9 @@ def fetch_cmd(chain_id: int, days: int, db_path: str) -> None:
     if chain_id not in CHAINS:
         raise ConfigError(f"Unsupported chain: {chain_id}")
 
+    chain = CHAINS[chain_id]
     api_key = os.environ.get("ETHERSCAN_API_KEY")
-    if not api_key:
+    if chain.log_source == "etherscan" and not api_key:
         raise ConfigError("ETHERSCAN_API_KEY environment variable is required")
 
     rpc_env = f"MEVSCOUT_RPC_{chain_id}"
@@ -41,7 +48,7 @@ def fetch_cmd(chain_id: int, days: int, db_path: str) -> None:
     store = Store(db_path)
     try:
         with httpx.Client() as http:
-            explorer = EtherscanClient(api_key=api_key, http=http)
+            explorer = create_log_source(chain=chain, http=http, api_key=api_key)
             rpc = RpcClient(url=rpc_url, http=http)
             fetch(chain_id=chain_id, days=days, explorer=explorer, rpc=rpc, store=store)
     finally:
@@ -97,7 +104,8 @@ def report_cmd(
             raise ConfigError(f"Unsupported chain: {cid}")
 
     api_key = os.environ.get("ETHERSCAN_API_KEY")
-    if not api_key:
+    needs_etherscan = any(CHAINS[cid].log_source == "etherscan" for cid in chain_ids)
+    if needs_etherscan and not api_key:
         raise ConfigError("ETHERSCAN_API_KEY environment variable is required")
 
     store = Store(db_path)
@@ -111,9 +119,10 @@ def report_cmd(
         start_ts = now_ts - (days * 86400)
 
         with httpx.Client() as http:
-            explorer = EtherscanClient(api_key=api_key, http=http)
-
             for cid in chain_ids:
+                chain = CHAINS[cid]
+                explorer = create_log_source(chain=chain, http=http, api_key=api_key)
+
                 rpc_env = f"MEVSCOUT_RPC_{cid}"
                 rpc_url = os.environ.get(rpc_env)
                 if not rpc_url:
