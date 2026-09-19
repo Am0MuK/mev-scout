@@ -111,6 +111,9 @@ class Store:
                 """
             )
             self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS swaps_pool_block ON swaps (chain_id, pool, block, log_index)"
+            )
+            self.conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS pool_fetched_ranges (
                     chain_id INTEGER NOT NULL,
@@ -444,6 +447,41 @@ class Store:
                 """,
                 rows,
             )
+
+    _SWAP_COLS = (
+        "chain_id, dex, pool, block, timestamp, tx_hash, log_index, "
+        "sender, recipient, amount0, amount1, sqrt_price_x96, liquidity, "
+        "tick, protocol_fees_token0, protocol_fees_token1"
+    )
+
+    @staticmethod
+    def _row_to_swap(r) -> DecodedSwap:
+        return DecodedSwap(
+            chain_id=r[0], dex=r[1], pool=r[2], block=r[3], timestamp=r[4], tx_hash=r[5],
+            log_index=r[6], sender=r[7], recipient=r[8], amount0=int(r[9]), amount1=int(r[10]),
+            sqrt_price_x96=int(r[11]), liquidity=int(r[12]), tick=r[13],
+            protocol_fees_token0=int(r[14]), protocol_fees_token1=int(r[15]),
+        )
+
+    def get_multi_pool_swaps(self, chain_id: int) -> list[DecodedSwap]:
+        """Swaps of transactions that touch at least two pools (only those can be arbitrage)."""
+        cur = self.conn.execute(
+            f"SELECT {self._SWAP_COLS} FROM swaps WHERE chain_id = ? AND tx_hash IN ("
+            " SELECT tx_hash FROM swaps WHERE chain_id = ? GROUP BY tx_hash HAVING COUNT(DISTINCT pool) >= 2"
+            ") ORDER BY block ASC, log_index ASC",
+            (chain_id, chain_id),
+        )
+        return [self._row_to_swap(r) for r in cur.fetchall()]
+
+    def get_last_swap(self, chain_id: int, pool: str, to_block: int) -> DecodedSwap | None:
+        """Most recent swap in `pool` at or before `to_block` (indexed, one row)."""
+        cur = self.conn.execute(
+            f"SELECT {self._SWAP_COLS} FROM swaps WHERE chain_id = ? AND pool = ? AND block <= ? "
+            "ORDER BY block DESC, log_index DESC LIMIT 1",
+            (chain_id, pool.lower(), to_block),
+        )
+        r = cur.fetchone()
+        return self._row_to_swap(r) if r else None
 
     def get_swaps(
         self,

@@ -176,10 +176,11 @@ def arb_census_cmd(
             raise CoverageError(f"no pools found for chain {chain_id}; run arb-pools first")
         pools = {p.address.lower(): p for p in pools_list}
 
-        swaps = store.get_swaps(chain_id)
-        if not swaps:
+        if store.conn.execute("SELECT 1 FROM swaps WHERE chain_id = ? LIMIT 1", (chain_id,)).fetchone() is None:
             raise CoverageError(f"no swaps found for chain {chain_id}; run arb-fetch first")
-
+        # Only transactions touching >= 2 pools can be arbitrage; loading all swaps
+        # (9.5M on Arbitrum for 90 days) does not fit in memory.
+        swaps = store.get_multi_pool_swaps(chain_id)
         raw_arbs = detect_arbitrages(swaps, pools=pools)
 
         with httpx.Client(timeout=30.0) as http:

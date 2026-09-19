@@ -82,3 +82,25 @@ def test_decimals_cache_round_trip(store):
     assert store.get_decimals(146, token) is None
     store.set_decimals(146, token.upper(), 18)
     assert store.get_decimals(146, token.lower()) == 18
+
+
+def _sw(pool, block, tx, li=0, ts=1000):
+    from mev_scout.swaps import DecodedSwap
+    return DecodedSwap(42161, "uniswap_v3", pool, block, ts, tx, li, "0xs", "0xr", 1, -1, 2**96, 1, 0)
+
+
+def test_multi_pool_swaps_only_returns_transactions_touching_two_pools():
+    # 9.5M real swaps do not fit in memory; only multi-pool transactions can be arbitrage.
+    st = Store(":memory:")
+    st.insert_swaps([_sw("0xa", 1, "0x1"), _sw("0xb", 1, "0x1", 1), _sw("0xa", 2, "0x2"), _sw("0xa", 3, "0x3"), _sw("0xa", 3, "0x3", 1)])
+    got = st.get_multi_pool_swaps(42161)
+    assert sorted({s.tx_hash for s in got}) == ["0x1"]
+    assert len(got) == 2
+
+
+def test_last_swap_at_or_before_block():
+    st = Store(":memory:")
+    st.insert_swaps([_sw("0xa", 5, "0x1"), _sw("0xa", 9, "0x2"), _sw("0xa", 9, "0x3", 7), _sw("0xa", 12, "0x4")])
+    last = st.get_last_swap(42161, "0xa", 10)
+    assert (last.block, last.log_index) == (9, 7)
+    assert st.get_last_swap(42161, "0xa", 4) is None

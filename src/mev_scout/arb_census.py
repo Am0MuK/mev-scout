@@ -312,10 +312,9 @@ def _find_weth_usd_price(
         t0, t1 = pool.token0.lower(), pool.token1.lower()
         if not ((t0 == weth and t1 in stables) or (t1 == weth and t0 in stables)):
             continue
-        earlier = store.get_swaps(chain_id=chain_id, to_block=block, pool=pool.address)
-        if not earlier:
+        last = store.get_last_swap(chain_id, pool.address, block)
+        if last is None:
             continue
-        last = max(earlier, key=lambda x: (x.block, x.log_index))
         if timestamp - last.timestamp > MAX_PRICE_AGE_S:
             continue
         if best is None or (last.block, last.log_index) > (best[0].block, best[0].log_index):
