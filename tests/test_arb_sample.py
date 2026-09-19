@@ -393,3 +393,13 @@ def test_pool_discovery_transport_error_is_not_a_missing_pool():
             raise _RE("HTTP 503")
     with _pytest.raises(_RE):
         discover_pools(42161, R())
+
+
+def test_sampled_block_bookkeeping_survives_restart():
+    # A 109-minute run was lost because results were written only at the end.
+    from mev_scout.store import Store
+    st = Store(":memory:")
+    st.mark_sampled_block(42161, 100, skipped=3, reverted=1, unpriced=0)
+    st.mark_sampled_block(42161, 200, skipped=2, reverted=0, unpriced=1)
+    assert st.get_sampled_blocks(42161) == {100, 200}
+    assert st.sampled_block_totals(42161) == (5, 1, 1)

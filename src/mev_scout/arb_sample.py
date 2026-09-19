@@ -4,6 +4,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
 import json
+import sys
 import time
 from typing import Any, Sequence
 
@@ -548,7 +549,29 @@ def run_arb_sampling(
     unpriced_blocks = 0
     all_results: list[ArbSampleResult] = []
 
-    for b in blocks:
+    # Results are saved after every sampled block and finished blocks are skipped
+    # on restart: a 109-minute run was once lost to a single transient RPC error.
+    done = store.get_sampled_blocks(chain_id)
+    snap = (0, 0, 0, 0)
+    prev_block: int | None = None
+
+    def _flush(blk: int) -> None:
+        store.insert_arb_samples(chain_id, all_results[snap[0]:])
+        store.mark_sampled_block(
+            chain_id, blk,
+            skipped=skipped_prefilter_pairs - snap[1],
+            reverted=reverted_quotes - snap[2],
+            unpriced=unpriced_blocks - snap[3],
+        )
+
+    todo = [b for b in blocks if b not in done]
+    for idx, b in enumerate(todo):
+        if prev_block is not None:
+            _flush(prev_block)
+            if idx % 10 == 0:
+                print(f"arb-sample: {len(done) + idx}/{len(blocks)} blocks", file=sys.stderr, flush=True)
+        snap = (len(all_results), skipped_prefilter_pairs, reverted_quotes, unpriced_blocks)
+        prev_block = b
         slot0_map, reverted = _read_slot0_mids(pools, b, rpc)
         reverted_quotes += reverted
         weth_price = _weth_usd_from_mids(pools, slot0_map)
@@ -643,6 +666,10 @@ def run_arb_sampling(
 
                         all_results.append(res)
 
+    if prev_block is not None:
+        _flush(prev_block)
+    skipped_prefilter_pairs, reverted_quotes, unpriced_blocks = store.sampled_block_totals(chain_id)
+
     meta = ArbSampleMeta(
         chain_id=chain_id,
         total_sampled_blocks=len(blocks),
@@ -652,6 +679,5 @@ def run_arb_sampling(
         to_block=to_block,
         unpriced_blocks=unpriced_blocks,
     )
-    store.insert_arb_samples(chain_id, all_results)
     store.set_arb_sample_meta(meta)
     return meta

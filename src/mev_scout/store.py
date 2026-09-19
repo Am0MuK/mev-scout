@@ -114,6 +114,12 @@ class Store:
                 "CREATE INDEX IF NOT EXISTS swaps_pool_block ON swaps (chain_id, pool, block, log_index)"
             )
             self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS arb_sampled_blocks ("
+                " chain_id INTEGER NOT NULL, block INTEGER NOT NULL,"
+                " skipped INTEGER NOT NULL, reverted INTEGER NOT NULL, unpriced INTEGER NOT NULL,"
+                " PRIMARY KEY (chain_id, block))"
+            )
+            self.conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS pool_fetched_ranges (
                     chain_id INTEGER NOT NULL,
@@ -593,6 +599,23 @@ class Store:
             gaps.append((cursor, to_block))
 
         return gaps
+
+    def mark_sampled_block(self, chain_id: int, block: int, skipped: int, reverted: int, unpriced: int) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO arb_sampled_blocks (chain_id, block, skipped, reverted, unpriced) VALUES (?, ?, ?, ?, ?)",
+                (chain_id, block, skipped, reverted, unpriced),
+            )
+
+    def get_sampled_blocks(self, chain_id: int) -> set[int]:
+        return {r[0] for r in self.conn.execute("SELECT block FROM arb_sampled_blocks WHERE chain_id = ?", (chain_id,))}
+
+    def sampled_block_totals(self, chain_id: int) -> tuple[int, int, int]:
+        r = self.conn.execute(
+            "SELECT COALESCE(SUM(skipped),0), COALESCE(SUM(reverted),0), COALESCE(SUM(unpriced),0) FROM arb_sampled_blocks WHERE chain_id = ?",
+            (chain_id,),
+        ).fetchone()
+        return (r[0], r[1], r[2])
 
     def insert_arb_samples(self, chain_id: int, results: list[Any]) -> None:
         if not results:
