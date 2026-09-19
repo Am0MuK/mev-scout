@@ -3,11 +3,17 @@
 Multi-chain venue definitions, adapters, pool discovery, and cross-chain quoting.
 """
 
+import csv
+import io
+import json
+import sys
+import time
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
 from mev_scout.dex import TokenConfig
+from mev_scout.report import evaluate_verdict
 from mev_scout.rpc import ContractCallError, RpcClient, RpcError
 
 # Selectors
@@ -879,5 +885,468 @@ def evaluate_cross_chain_gap(
         gap_pct=gap_pct,
         is_opportunity=is_opp,
     )
+
+
+@dataclass
+class XChainPairSizeReport:
+    chain_pair: str
+    size_usd: Decimal
+    total_moments: int
+    executable_moments: int
+    executable_share: Decimal
+    median_net_usd: Decimal
+    p90_net_usd: Decimal
+    max_net_usd: Decimal
+    persistence_dist: dict[str, int]
+    monthly_net_usd: Decimal
+    monthly_net_eur: Decimal
+    capital_usd: Decimal
+    capital_eur: Decimal
+    return_on_capital_pct: Decimal
+
+
+@dataclass
+class XChainReport:
+    from_timestamp: int
+    to_timestamp: int
+    days: int
+    eurusd: Decimal
+    threshold_eur: Decimal
+    total_sampled_moments: int
+    pair_size_reports: dict[tuple[str, Decimal], XChainPairSizeReport]
+    overall_verdict: str
+    overall_verdict_reason: str
+    total_capital_eur: Decimal
+    opportunities: list[XChainOpportunity]
+
+    def to_text(self) -> str:
+        lines = [
+            "================================================================================",
+            "mev-scout Phase 2C — Cross-Chain Inventory Arbitrage Census",
+            "================================================================================",
+            f"Window: {self.days} days | EUR/USD: {self.eurusd} | Threshold: {self.threshold_eur:.0f} EUR/mo",
+            f"Sampled moments: {self.total_sampled_moments} (from {self.from_timestamp} to {self.to_timestamp})",
+            f"Capital required: {self.total_capital_eur:,.2f} EUR",
+            f"Verdict: {self.overall_verdict}"
+            + (f" ({self.overall_verdict_reason})" if self.overall_verdict_reason else "")
+            + f" | Capital needed: {self.total_capital_eur:,.2f} EUR",
+            "",
+            "Note: Upper bound: real execution adds latency, partial fills and price risk between legs.",
+            "",
+            "Results Per Chain Pair and Size:",
+            "--------------------------------------------------------------------------------",
+        ]
+        for (pair, size), rep in sorted(
+            self.pair_size_reports.items(), key=lambda item: (item[0][0], item[0][1])
+        ):
+            lines.append(f"Pair: {pair} | Size: ${size:,.0f}")
+            lines.append(
+                f"  Executable moments: {rep.executable_moments}/{rep.total_moments} ({rep.executable_share * 100:.1f}%)"
+            )
+            lines.append(
+                f"  Net per trade: median=${rep.median_net_usd:,.2f}, p90=${rep.p90_net_usd:,.2f}, max=${rep.max_net_usd:,.2f}"
+            )
+            lines.append(
+                f"  Persistence distribution: next_block={rep.persistence_dist.get('next_block', 0)}, "
+                f"1m={rep.persistence_dist.get('1m', 0)}, 5m={rep.persistence_dist.get('5m', 0)}"
+            )
+            lines.append(
+                f"  Monthly net: ${rep.monthly_net_usd:,.2f} ({rep.monthly_net_eur:,.2f} EUR)"
+            )
+            lines.append(
+                f"  Capital required: ${rep.capital_usd:,.2f} ({rep.capital_eur:,.2f} EUR)"
+            )
+            lines.append(f"  Return on capital: {rep.return_on_capital_pct:.2f}%")
+            lines.append("--------------------------------------------------------------------------------")
+
+        lines.append("================================================================================")
+        return "\n".join(lines)
+
+    def to_json(self) -> str:
+        d = {
+            "from_timestamp": self.from_timestamp,
+            "to_timestamp": self.to_timestamp,
+            "days": self.days,
+            "eurusd": str(self.eurusd),
+            "threshold_eur": str(self.threshold_eur),
+            "total_sampled_moments": self.total_sampled_moments,
+            "overall_verdict": self.overall_verdict,
+            "overall_verdict_reason": self.overall_verdict_reason,
+            "total_capital_eur": str(self.total_capital_eur),
+            "pair_size_reports": {
+                f"{k[0]}_{k[1]}": {
+                    "chain_pair": v.chain_pair,
+                    "size_usd": str(v.size_usd),
+                    "total_moments": v.total_moments,
+                    "executable_moments": v.executable_moments,
+                    "executable_share": str(v.executable_share),
+                    "median_net_usd": str(v.median_net_usd),
+                    "p90_net_usd": str(v.p90_net_usd),
+                    "max_net_usd": str(v.max_net_usd),
+                    "persistence_dist": v.persistence_dist,
+                    "monthly_net_usd": str(v.monthly_net_usd),
+                    "monthly_net_eur": str(v.monthly_net_eur),
+                    "capital_usd": str(v.capital_usd),
+                    "capital_eur": str(v.capital_eur),
+                    "return_on_capital_pct": str(v.return_on_capital_pct),
+                }
+                for k, v in self.pair_size_reports.items()
+            },
+        }
+        return json.dumps(d, indent=2)
+
+    def to_csv(self) -> str:
+        out = io.StringIO()
+        writer = csv.writer(out)
+        writer.writerow([
+            "moment",
+            "chain_buy",
+            "chain_sell",
+            "block_buy",
+            "block_sell",
+            "pool_buy",
+            "pool_sell",
+            "size_usd",
+            "gross_usd",
+            "gas_usd",
+            "rebalance_usd",
+            "net_usd",
+            "net_eur",
+            "gap_pct",
+            "is_opportunity",
+            "persisted_next_block",
+            "persisted_1m",
+            "persisted_5m",
+        ])
+        for o in self.opportunities:
+            net_eur = (o.net_usd / self.eurusd) if self.eurusd > 0 else Decimal("0")
+            writer.writerow([
+                o.moment,
+                o.chain_buy,
+                o.chain_sell,
+                o.block_buy,
+                o.block_sell,
+                o.pool_buy,
+                o.pool_sell,
+                str(o.size_usd),
+                str(o.gross_usd),
+                str(o.gas_usd),
+                str(o.rebalance_usd),
+                str(o.net_usd),
+                str(net_eur),
+                str(o.gap_pct),
+                1 if o.is_opportunity else 0,
+                "" if o.persisted_next_block is None else (1 if o.persisted_next_block else 0),
+                "" if o.persisted_1m is None else (1 if o.persisted_1m else 0),
+                "" if o.persisted_5m is None else (1 if o.persisted_5m else 0),
+            ])
+        return out.getvalue()
+
+
+def generate_xchain_report(
+    opportunities: list[XChainOpportunity],
+    total_moments: int,
+    days: int,
+    eurusd: Decimal,
+    threshold_eur: Decimal = Decimal("300"),
+    from_ts: int = 0,
+    to_ts: int = 0,
+) -> XChainReport:
+    """Aggregate opportunities per chain pair and size, compute RoC, and determine verdict."""
+    by_pair_size: dict[tuple[str, Decimal], list[XChainOpportunity]] = {}
+    for o in opportunities:
+        pair_key = f"{o.chain_buy}-{o.chain_sell}"
+        key = (pair_key, o.size_usd)
+        by_pair_size.setdefault(key, []).append(o)
+
+    pair_reports: dict[tuple[str, Decimal], XChainPairSizeReport] = {}
+    total_capital_usd = Decimal("0")
+    max_size_per_pair: dict[str, Decimal] = {}
+
+    for (pair_name, size), opps in by_pair_size.items():
+        exec_opps = [o for o in opps if o.is_opportunity and o.persisted_next_block is True]
+        exec_count = len(exec_opps)
+        share = Decimal(exec_count) / Decimal(total_moments) if total_moments > 0 else Decimal("0")
+
+        if exec_opps:
+            sorted_nets = sorted(o.net_usd for o in exec_opps)
+            n = len(sorted_nets)
+            median_net = sorted_nets[n // 2]
+            p90_net = sorted_nets[min(n - 1, int(0.90 * n))]
+            max_net = sorted_nets[-1]
+            sum_net = sum(sorted_nets, Decimal("0"))
+        else:
+            median_net = Decimal("0")
+            p90_net = Decimal("0")
+            max_net = Decimal("0")
+            sum_net = Decimal("0")
+
+        p_dist = {
+            "next_block": sum(1 for o in exec_opps if o.persisted_next_block),
+            "1m": sum(1 for o in exec_opps if o.persisted_1m),
+            "5m": sum(1 for o in exec_opps if o.persisted_5m),
+        }
+
+        monthly_usd = (sum_net / Decimal(days)) * Decimal("30") if days > 0 else Decimal("0")
+        monthly_eur = (monthly_usd / eurusd) if eurusd > 0 else Decimal("0")
+
+        # Required inventory = largest size traded held as USDC and WETH on every chain in the pair (4x)
+        cap_usd = Decimal("4") * size
+        cap_eur = (cap_usd / eurusd) if eurusd > 0 else Decimal("0")
+        roc = (monthly_eur / cap_eur * Decimal("100")) if cap_eur > 0 else Decimal("0")
+
+        pair_reports[(pair_name, size)] = XChainPairSizeReport(
+            chain_pair=pair_name,
+            size_usd=size,
+            total_moments=total_moments,
+            executable_moments=exec_count,
+            executable_share=share,
+            median_net_usd=median_net,
+            p90_net_usd=p90_net,
+            max_net_usd=max_net,
+            persistence_dist=p_dist,
+            monthly_net_usd=monthly_usd,
+            monthly_net_eur=monthly_eur,
+            capital_usd=cap_usd,
+            capital_eur=cap_eur,
+            return_on_capital_pct=roc,
+        )
+
+        if size > max_size_per_pair.get(pair_name, Decimal("0")):
+            max_size_per_pair[pair_name] = size
+
+    # Total capital required across unique pairs
+    for pair_name, max_size in max_size_per_pair.items():
+        total_capital_usd += Decimal("4") * max_size
+
+    total_capital_eur = (total_capital_usd / eurusd) if eurusd > 0 else Decimal("0")
+
+    # Overall monthly net EUR across best sizes
+    pair_best_monthly_eur: dict[str, Decimal] = {}
+    for (pair_name, _), rep in pair_reports.items():
+        if rep.monthly_net_eur > pair_best_monthly_eur.get(pair_name, Decimal("0")):
+            pair_best_monthly_eur[pair_name] = rep.monthly_net_eur
+
+    overall_monthly_eur = sum(pair_best_monthly_eur.values(), Decimal("0"))
+    verdict, reason = evaluate_verdict(
+        [overall_monthly_eur] if overall_monthly_eur > 0 else [],
+        top1_share=Decimal("0"),
+        threshold_eur=threshold_eur,
+    )
+
+    return XChainReport(
+        from_timestamp=from_ts,
+        to_timestamp=to_ts,
+        days=days,
+        eurusd=eurusd,
+        threshold_eur=threshold_eur,
+        total_sampled_moments=total_moments,
+        pair_size_reports=pair_reports,
+        overall_verdict=verdict,
+        overall_verdict_reason=reason,
+        total_capital_eur=total_capital_eur,
+        opportunities=opportunities,
+    )
+
+
+def parse_dense_ranges(dense_ranges: list[str] | None) -> list[tuple[int, int]]:
+    """Parse list of 'FROM:TO' timestamp strings into (from_ts, to_ts) tuples."""
+    if not dense_ranges:
+        return []
+    res = []
+    for r in dense_ranges:
+        parts = r.split(":")
+        if len(parts) == 2:
+            try:
+                res.append((int(parts[0]), int(parts[1])))
+            except ValueError:
+                continue
+    return res
+
+
+def run_xchain_sample(
+    rpcs: dict[int, RpcClient],
+    store: Any,
+    days: int = 30,
+    every_min: int = 5,
+    dense_ranges: list[str] | None = None,
+    rebalance_pct: Decimal = DEFAULT_REBALANCE_PCT,
+    rebalance_fixed_usd: Decimal = DEFAULT_REBALANCE_FIXED_USD,
+    now_ts: int | None = None,
+    start_ts: int | None = None,
+    progress_stream: Any = None,
+) -> None:
+    """Run sampling across time grid for cross-chain arbitrage.
+
+    Saves results after every sampled moment and supports resume.
+    Prints progress to stderr every 10 moments.
+    """
+    pools: dict[int, list[XChainPool]] = {}
+    for cid in (42161, 8453, 10):
+        stored = store.get_xchain_pools(cid)
+        if stored:
+            pools[cid] = stored
+        else:
+            discovered = discover_xchain_pools(rpcs[cid], cid)
+            store.insert_xchain_pools(discovered)
+            pools[cid] = discovered
+
+    end_ts = now_ts if now_ts is not None else int(time.time())
+    if start_ts is None:
+        start_ts = end_ts - days * 86400
+    dense = parse_dense_ranges(dense_ranges)
+    grid = generate_time_grid(start_ts, end_ts, step_s=every_min * 60, dense_ranges=dense)
+
+    completed = store.get_completed_xchain_moments()
+    chain_pairs = [(42161, 8453), (42161, 10), (8453, 10)]
+
+    for idx, moment in enumerate(grid):
+        if moment in completed:
+            continue
+
+        chain_blocks: dict[int, tuple[int, int]] = {}
+        for cid in (42161, 8453, 10):
+            b_num, b_ts = find_block_by_timestamp(
+                chain_id=cid,
+                target_ts=moment,
+                rpc=rpcs[cid],
+                store=store,
+            )
+            chain_blocks[cid] = (b_num, b_ts)
+
+        passes_skew, skew_s = check_moment_skew(moment, chain_blocks, max_age_s=5)
+        if not passes_skew:
+            store.record_xchain_moment(moment, status="skewed", skew_s=skew_s)
+            continue
+
+        moment_opps: list[XChainOpportunity] = []
+        for chain_a, chain_b in chain_pairs:
+            block_a = chain_blocks[chain_a][0]
+            block_b = chain_blocks[chain_b][0]
+
+            try:
+                slot0_a = rpcs[chain_a].call(CANONICAL_DEEPEST_POOLS[chain_a], SLOT0_SELECTOR, block_a)
+                price_a = decode_slot0_weth_usdc_price(chain_a, slot0_a)
+            except ContractCallError:
+                continue
+
+            try:
+                slot0_b = rpcs[chain_b].call(CANONICAL_DEEPEST_POOLS[chain_b], SLOT0_SELECTOR, block_b)
+                price_b = decode_slot0_weth_usdc_price(chain_b, slot0_b)
+            except ContractCallError:
+                continue
+
+            passes_pref, _, _ = check_prefilter(
+                price_a,
+                DEEPEST_POOL_FEES[chain_a],
+                price_b,
+                DEEPEST_POOL_FEES[chain_b],
+                rebalance_pct=rebalance_pct,
+            )
+            if not passes_pref:
+                continue
+
+            if price_a <= price_b:
+                c_buy, c_sell = chain_a, chain_b
+                p_buy, p_sell = price_a, price_b
+            else:
+                c_buy, c_sell = chain_b, chain_a
+                p_buy, p_sell = price_b, price_a
+
+            b_buy = chain_blocks[c_buy][0]
+            b_sell = chain_blocks[c_sell][0]
+
+            for size in XCHAIN_SIZES_USD:
+                opp = evaluate_cross_chain_gap(
+                    moment=moment,
+                    chain_buy=c_buy,
+                    chain_sell=c_sell,
+                    block_buy=b_buy,
+                    block_sell=b_sell,
+                    rpc_buy=rpcs[c_buy],
+                    rpc_sell=rpcs[c_sell],
+                    pools_buy=pools[c_buy],
+                    pools_sell=pools[c_sell],
+                    size_usd=size,
+                    mid_price_buy=p_buy,
+                    mid_price_sell=p_sell,
+                    rebalance_pct=rebalance_pct,
+                    rebalance_fixed_usd=rebalance_fixed_usd,
+                )
+                if opp is not None:
+                    if opp.is_opportunity:
+                        # 1. next blocks on both chains
+                        opp_next = evaluate_cross_chain_gap(
+                            moment=moment,
+                            chain_buy=c_buy,
+                            chain_sell=c_sell,
+                            block_buy=b_buy + 1,
+                            block_sell=b_sell + 1,
+                            rpc_buy=rpcs[c_buy],
+                            rpc_sell=rpcs[c_sell],
+                            pools_buy=pools[c_buy],
+                            pools_sell=pools[c_sell],
+                            size_usd=size,
+                            mid_price_buy=p_buy,
+                            mid_price_sell=p_sell,
+                            rebalance_pct=rebalance_pct,
+                            rebalance_fixed_usd=rebalance_fixed_usd,
+                        )
+                        opp.persisted_next_block = (
+                            opp_next is not None and opp_next.is_opportunity
+                        )
+
+                        # 2. +1 min
+                        b_buy_1m, _ = find_block_by_timestamp(c_buy, moment + 60, rpcs[c_buy], store=store)
+                        b_sell_1m, _ = find_block_by_timestamp(c_sell, moment + 60, rpcs[c_sell], store=store)
+                        opp_1m = evaluate_cross_chain_gap(
+                            moment=moment,
+                            chain_buy=c_buy,
+                            chain_sell=c_sell,
+                            block_buy=b_buy_1m,
+                            block_sell=b_sell_1m,
+                            rpc_buy=rpcs[c_buy],
+                            rpc_sell=rpcs[c_sell],
+                            pools_buy=pools[c_buy],
+                            pools_sell=pools[c_sell],
+                            size_usd=size,
+                            mid_price_buy=p_buy,
+                            mid_price_sell=p_sell,
+                            rebalance_pct=rebalance_pct,
+                            rebalance_fixed_usd=rebalance_fixed_usd,
+                        )
+                        opp.persisted_1m = opp_1m is not None and opp_1m.is_opportunity
+
+                        # 3. +5 min
+                        b_buy_5m, _ = find_block_by_timestamp(c_buy, moment + 300, rpcs[c_buy], store=store)
+                        b_sell_5m, _ = find_block_by_timestamp(c_sell, moment + 300, rpcs[c_sell], store=store)
+                        opp_5m = evaluate_cross_chain_gap(
+                            moment=moment,
+                            chain_buy=c_buy,
+                            chain_sell=c_sell,
+                            block_buy=b_buy_5m,
+                            block_sell=b_sell_5m,
+                            rpc_buy=rpcs[c_buy],
+                            rpc_sell=rpcs[c_sell],
+                            pools_buy=pools[c_buy],
+                            pools_sell=pools[c_sell],
+                            size_usd=size,
+                            mid_price_buy=p_buy,
+                            mid_price_sell=p_sell,
+                            rebalance_pct=rebalance_pct,
+                            rebalance_fixed_usd=rebalance_fixed_usd,
+                        )
+                        opp.persisted_5m = opp_5m is not None and opp_5m.is_opportunity
+
+                    moment_opps.append(opp)
+
+        if moment_opps:
+            store.insert_xchain_opportunities(moment_opps)
+        store.record_xchain_moment(moment, status="completed", skew_s=skew_s)
+
+        if progress_stream is not None and (idx + 1) % 10 == 0:
+            progress_stream.write(f"Sampled {idx + 1}/{len(grid)} moments\n")
+            progress_stream.flush()
+
 
 

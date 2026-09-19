@@ -1,5 +1,6 @@
 """SQLite store for liquidations, fetched ranges, and RPC call caching."""
 
+from decimal import Decimal
 from pathlib import Path
 import sqlite3
 from typing import Any
@@ -175,6 +176,39 @@ class Store:
                     factory TEXT NOT NULL,
                     quoter TEXT,
                     PRIMARY KEY (chain_id, address)
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS xchain_opportunities (
+                    moment INTEGER NOT NULL,
+                    chain_buy INTEGER NOT NULL,
+                    chain_sell INTEGER NOT NULL,
+                    block_buy INTEGER NOT NULL,
+                    block_sell INTEGER NOT NULL,
+                    pool_buy TEXT NOT NULL,
+                    pool_sell TEXT NOT NULL,
+                    size_usd TEXT NOT NULL,
+                    gross_usd TEXT NOT NULL,
+                    gas_usd TEXT NOT NULL,
+                    rebalance_usd TEXT NOT NULL,
+                    net_usd TEXT NOT NULL,
+                    gap_pct TEXT NOT NULL,
+                    is_opportunity INTEGER NOT NULL,
+                    persisted_next_block INTEGER,
+                    persisted_1m INTEGER,
+                    persisted_5m INTEGER,
+                    PRIMARY KEY (moment, chain_buy, chain_sell, size_usd)
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS xchain_moments (
+                    moment INTEGER PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    skew_s INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
@@ -806,6 +840,98 @@ class Store:
                 )
             )
         return result
+
+    def insert_xchain_opportunities(self, opps: list[Any]) -> None:
+        if not opps:
+            return
+        with self.conn:
+            self.conn.executemany(
+                """
+                INSERT OR REPLACE INTO xchain_opportunities (
+                    moment, chain_buy, chain_sell, block_buy, block_sell,
+                    pool_buy, pool_sell, size_usd, gross_usd, gas_usd,
+                    rebalance_usd, net_usd, gap_pct, is_opportunity,
+                    persisted_next_block, persisted_1m, persisted_5m
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        o.moment,
+                        o.chain_buy,
+                        o.chain_sell,
+                        o.block_buy,
+                        o.block_sell,
+                        o.pool_buy,
+                        o.pool_sell,
+                        str(o.size_usd),
+                        str(o.gross_usd),
+                        str(o.gas_usd),
+                        str(o.rebalance_usd),
+                        str(o.net_usd),
+                        str(o.gap_pct),
+                        1 if o.is_opportunity else 0,
+                        None if o.persisted_next_block is None else (1 if o.persisted_next_block else 0),
+                        None if o.persisted_1m is None else (1 if o.persisted_1m else 0),
+                        None if o.persisted_5m is None else (1 if o.persisted_5m else 0),
+                    )
+                    for o in opps
+                ],
+            )
+
+    def get_xchain_opportunities(self) -> list[Any]:
+        from mev_scout.xchain import XChainOpportunity
+
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT moment, chain_buy, chain_sell, block_buy, block_sell,
+                   pool_buy, pool_sell, size_usd, gross_usd, gas_usd,
+                   rebalance_usd, net_usd, gap_pct, is_opportunity,
+                   persisted_next_block, persisted_1m, persisted_5m
+            FROM xchain_opportunities
+            ORDER BY moment ASC, chain_buy ASC, chain_sell ASC, CAST(size_usd AS REAL) ASC
+            """
+        )
+        rows = cur.fetchall()
+        result = []
+        for r in rows:
+            result.append(
+                XChainOpportunity(
+                    moment=r[0],
+                    chain_buy=r[1],
+                    chain_sell=r[2],
+                    block_buy=r[3],
+                    block_sell=r[4],
+                    pool_buy=r[5],
+                    pool_sell=r[6],
+                    size_usd=Decimal(r[7]),
+                    gross_usd=Decimal(r[8]),
+                    gas_usd=Decimal(r[9]),
+                    rebalance_usd=Decimal(r[10]),
+                    net_usd=Decimal(r[11]),
+                    gap_pct=Decimal(r[12]),
+                    is_opportunity=bool(r[13]),
+                    persisted_next_block=None if r[14] is None else bool(r[14]),
+                    persisted_1m=None if r[15] is None else bool(r[15]),
+                    persisted_5m=None if r[16] is None else bool(r[16]),
+                )
+            )
+        return result
+
+    def record_xchain_moment(self, moment: int, status: str, skew_s: int = 0) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO xchain_moments (moment, status, skew_s)
+                VALUES (?, ?, ?)
+                """,
+                (moment, status, skew_s),
+            )
+
+    def get_completed_xchain_moments(self) -> set[int]:
+        cur = self.conn.cursor()
+        cur.execute("SELECT moment FROM xchain_moments")
+        return {r[0] for r in cur.fetchall()}
 
     def close(self) -> None:
         self.conn.close()

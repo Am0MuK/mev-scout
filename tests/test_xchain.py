@@ -858,3 +858,309 @@ def test_evaluate_cross_chain_gap():
     assert opp.is_opportunity is True
 
 
+def test_store_xchain_opportunities_and_moments(tmp_path):
+    from mev_scout.store import Store
+    from mev_scout.xchain import XChainOpportunity
+
+    db_path = str(tmp_path / "test_store.db")
+    store = Store(db_path)
+
+    opp = XChainOpportunity(
+        moment=1700000000,
+        chain_buy=42161,
+        chain_sell=8453,
+        block_buy=1000,
+        block_sell=2000,
+        pool_buy="0x1111111111111111111111111111111111111111",
+        pool_sell="0x2222222222222222222222222222222222222222",
+        size_usd=Decimal("10000"),
+        gross_usd=Decimal("120.00"),
+        gas_usd=Decimal("0.10"),
+        rebalance_usd=Decimal("6.00"),
+        net_usd=Decimal("113.90"),
+        gap_pct=Decimal("0.012"),
+        is_opportunity=True,
+        persisted_next_block=True,
+        persisted_1m=True,
+        persisted_5m=False,
+    )
+
+    store.insert_xchain_opportunities([opp])
+    loaded = store.get_xchain_opportunities()
+    assert len(loaded) == 1
+    assert loaded[0].moment == 1700000000
+    assert loaded[0].chain_buy == 42161
+    assert loaded[0].chain_sell == 8453
+    assert loaded[0].net_usd == Decimal("113.90")
+    assert loaded[0].persisted_next_block is True
+    assert loaded[0].persisted_1m is True
+    assert loaded[0].persisted_5m is False
+
+    # Moments completion & resume
+    assert 1700000000 not in store.get_completed_xchain_moments()
+    store.record_xchain_moment(1700000000, status="completed", skew_s=2)
+    assert 1700000000 in store.get_completed_xchain_moments()
+    store.close()
+
+
+def test_xchain_report_generation_and_verdict():
+    from mev_scout.xchain import (
+        XChainOpportunity,
+        generate_xchain_report,
+        XChainReport,
+    )
+
+    # Construct 10 opportunities for Arbitrum-Base 10k:
+    # 3 executable (profitable and persisted_next_block=True)
+    # 1 profitable but next block dropped (not executable)
+    # 6 unprofitable
+    opps = []
+    # 3 executable
+    for i, net in enumerate([Decimal("50.00"), Decimal("100.00"), Decimal("150.00")]):
+        opps.append(
+            XChainOpportunity(
+                moment=1700000000 + i * 300,
+                chain_buy=42161,
+                chain_sell=8453,
+                block_buy=1000 + i,
+                block_sell=2000 + i,
+                pool_buy="0x1111111111111111111111111111111111111111",
+                pool_sell="0x2222222222222222222222222222222222222222",
+                size_usd=Decimal("10000"),
+                gross_usd=net + Decimal("10"),
+                gas_usd=Decimal("4.00"),
+                rebalance_usd=Decimal("6.00"),
+                net_usd=net,
+                gap_pct=Decimal("0.01"),
+                is_opportunity=True,
+                persisted_next_block=True,
+                persisted_1m=(i >= 1),  # 2 persisted 1m
+                persisted_5m=(i >= 2),  # 1 persisted 5m
+            )
+        )
+    # 1 profitable but next block dropped (not executable)
+    opps.append(
+        XChainOpportunity(
+            moment=1700000000 + 3 * 300,
+            chain_buy=42161,
+            chain_sell=8453,
+            block_buy=1003,
+            block_sell=2003,
+            pool_buy="0x1111111111111111111111111111111111111111",
+            pool_sell="0x2222222222222222222222222222222222222222",
+            size_usd=Decimal("10000"),
+            gross_usd=Decimal("20.00"),
+            gas_usd=Decimal("5.00"),
+            rebalance_usd=Decimal("6.00"),
+            net_usd=Decimal("9.00"),
+            gap_pct=Decimal("0.002"),
+            is_opportunity=True,
+            persisted_next_block=False,
+        )
+    )
+
+    report = generate_xchain_report(
+        opportunities=opps,
+        total_moments=10,
+        days=30,
+        eurusd=Decimal("1.10"),
+        threshold_eur=Decimal("300"),
+        from_ts=1700000000,
+        to_ts=1700000000 + 10 * 300,
+    )
+
+    assert isinstance(report, XChainReport)
+    # Pair report
+    pair_rep = report.pair_size_reports[("42161-8453", Decimal("10000"))]
+    assert pair_rep.executable_moments == 3
+    assert pair_rep.total_moments == 10
+    assert pair_rep.executable_share == Decimal("0.3")  # 3/10
+    assert pair_rep.median_net_usd == Decimal("100.00")
+    assert pair_rep.p90_net_usd == Decimal("150.00")
+    assert pair_rep.max_net_usd == Decimal("150.00")
+
+    # Capital required: 4 * 10,000 = 40,000 USD
+    assert pair_rep.capital_usd == Decimal("40000")
+    assert pair_rep.capital_eur == Decimal("40000") / Decimal("1.10")
+
+    # Persistence distribution
+    assert pair_rep.persistence_dist["next_block"] == 3
+    assert pair_rep.persistence_dist["1m"] == 2
+    assert pair_rep.persistence_dist["5m"] == 1
+
+    # Text report
+    txt = report.to_text()
+    assert "Upper bound: real execution adds latency" in txt
+    assert "Capital required:" in txt
+    assert "Verdict:" in txt
+    assert "42161-8453" in txt
+
+    # JSON report
+    js = report.to_json()
+    assert '"capital_usd": "40000"' in js
+
+    # CSV report
+    csv_str = report.to_csv()
+    assert "moment,chain_buy,chain_sell" in csv_str
+    assert "1700000000,42161,8453" in csv_str
+
+
+def test_xchain_sample_and_report_cli(tmp_path, monkeypatch):
+    import io
+    from mev_scout.cli import main
+    from mev_scout.store import Store
+
+    db_file = str(tmp_path / "xchain.db")
+
+    # 1. Missing RPC env vars triggers error
+    monkeypatch.delenv("MEVSCOUT_RPC_42161", raising=False)
+    monkeypatch.delenv("MEVSCOUT_RPC_8453", raising=False)
+    monkeypatch.delenv("MEVSCOUT_RPC_10", raising=False)
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["xchain-sample", "--db", db_file])
+    assert exc_info.value.code != 0
+
+    # 2. Report CLI with empty DB
+    store = Store(db_file)
+    store.close()
+
+    stdout_capture = io.StringIO()
+    monkeypatch.setattr("sys.stdout", stdout_capture)
+    with pytest.raises(SystemExit) as exc_info:
+        main(["xchain-report", "--eurusd", "1.10", "--db", db_file])
+    assert exc_info.value.code == 0
+    assert "Phase 2C — Cross-Chain Inventory Arbitrage Census" in stdout_capture.getvalue()
+
+
+def test_run_xchain_sample_and_resume(tmp_path):
+    import io
+    from mev_scout.store import Store
+    from mev_scout.xchain import run_xchain_sample, XChainPool
+
+    db_file = str(tmp_path / "xchain_sample.db")
+    store = Store(db_file)
+
+    # Pre-insert pools for all 3 chains so discovery is bypassed
+    pool_arb = XChainPool(
+        chain_id=42161,
+        venue_name="uniswap_v3",
+        address="0xc6962004f452be9203591991d15f6b388e09e8d0",
+        token0="0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+        token1="0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+        pool_key=500,
+        adapter_type="uniswap_v3",
+        factory="0x1f98431c8ad98523631ae4a59f267346ea31f984",
+        quoter="0xb27308f9f90d607463bb33ea1bebb41c27ce5ab6",
+    )
+    pool_base = XChainPool(
+        chain_id=8453,
+        venue_name="uniswap_v3",
+        address="0xb4cb800922cc596700c50d4f3b64c12ea85fa8ce",
+        token0="0x4200000000000000000000000000000000000006",
+        token1="0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        pool_key=100,
+        adapter_type="uniswap_v3",
+        factory="0x33128a8fc17869897dce68ed026d694621f6fdfd",
+        quoter="0x3d4e44eb1374240ce5f1b871ab261cd16335b76a",
+    )
+    pool_op = XChainPool(
+        chain_id=10,
+        venue_name="uniswap_v3",
+        address="0xc1738d90c0f3056157f44d8525b642674e2d2740",
+        token0="0x0b2c639c533813f4aa9d7837caf62653d097ff85",
+        token1="0x4200000000000000000000000000000000000006",
+        pool_key=3000,
+        adapter_type="uniswap_v3",
+        factory="0x1f98431c8ad98523631ae4a59f267346ea31f984",
+        quoter="0xb27308f9f90d607463bb33ea1bebb41c27ce5ab6",
+    )
+    store.insert_xchain_pools([pool_arb, pool_base, pool_op])
+
+    now_ts = 1700000000
+
+    class MockSimpleRpc:
+        def __init__(self, chain_id: int):
+            self.chain_id = chain_id
+            self.call_count = 0
+
+        def block_number(self) -> int:
+            return 850_000_050
+
+        def _call(self, method: str, params: list):
+            if method == "eth_getBlockByNumber":
+                b_num = int(params[0], 16) if isinstance(params[0], str) and params[0].startswith("0x") else int(params[0])
+                # Each block has timestamp = b_num * 2
+                return {
+                    "number": hex(b_num),
+                    "timestamp": hex(b_num * 2),
+                    "baseFeePerGas": "0x3b9aca00",
+                }
+            raise ValueError(f"Unknown method {method}")
+
+        def call(self, to: str, data: str, block: int | str):
+            self.call_count += 1
+            if to.lower() == "0x420000000000000000000000000000000000000f":
+                return "0x" + hex(2_000_000_000)[2:].rjust(64, "0")
+
+            # Check if slot0
+            if data.startswith("0x3850c7bd"):
+                # Return sqrtPriceX96 for ~2600 USD
+                if self.chain_id == 10:
+                    sqrt_p = int((Decimal(10**12) / Decimal(2600)).sqrt() * Decimal(2**96))
+                else:
+                    sqrt_p = int((Decimal(2600) / Decimal(10**12)).sqrt() * Decimal(2**96))
+                return "0x" + hex(sqrt_p)[2:].rjust(64, "0") + "0" * 128
+
+            # Quoter calls:
+            # return 1 WETH for 2600 USDC or 2600 USDC for 1 WETH
+            amt_out = 10**18
+            gas = 120_000
+            res = hex(amt_out)[2:].rjust(64, "0") + "0" * 128 + hex(gas)[2:].rjust(64, "0")
+            return "0x" + res
+
+    rpcs = {
+        42161: MockSimpleRpc(42161),
+        8453: MockSimpleRpc(8453),
+        10: MockSimpleRpc(10),
+    }
+
+    # Run for 1 hour (13 moments of 5 mins)
+    prog_io = io.StringIO()
+    run_xchain_sample(
+        rpcs=rpcs,
+        store=store,
+        days=0,
+        start_ts=now_ts - 3600,
+        every_min=5,
+        now_ts=now_ts,
+        progress_stream=prog_io,
+    )
+
+    # 1. Moments saved
+    completed_1 = store.get_completed_xchain_moments()
+    assert len(completed_1) > 0
+    # Check progress printed every 10 moments
+    assert "Sampled 10/" in prog_io.getvalue()
+
+    # 2. Resume test: Running again on the same DB should skip all completed moments
+    call_counts_before = {cid: r.call_count for cid, r in rpcs.items()}
+    prog_io_2 = io.StringIO()
+    run_xchain_sample(
+        rpcs=rpcs,
+        store=store,
+        days=0,
+        start_ts=now_ts - 3600,
+        every_min=5,
+        now_ts=now_ts,
+        progress_stream=prog_io_2,
+    )
+    # No new RPC calls made because all moments were already completed!
+    call_counts_after = {cid: r.call_count for cid, r in rpcs.items()}
+    assert call_counts_before == call_counts_after
+    assert prog_io_2.getvalue() == ""
+
+    store.close()
+
+
+
