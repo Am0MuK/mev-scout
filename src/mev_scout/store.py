@@ -158,6 +158,12 @@ class Store:
                 (chain_id, from_block, to_block),
             )
 
+    def last_fetched_block(self, chain_id: int) -> int | None:
+        row = self.conn.execute(
+            "SELECT MAX(to_block) FROM fetched_ranges WHERE chain_id = ?", (chain_id,)
+        ).fetchone()
+        return row[0] if row and row[0] is not None else None
+
     def covered(self, chain_id: int, from_block: int, to_block: int) -> list[tuple[int, int]]:
         if from_block > to_block:
             return []

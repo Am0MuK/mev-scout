@@ -194,3 +194,42 @@ def test_report_with_l1_warning():
     data = json.loads(json_str)
     assert data["chains"][0]["validation"]["l1_fee_share"] == "0.185"
     assert len(data["chains"][0]["validation"]["l1_warnings"]) == 1
+
+
+def test_event_on_month_boundary_is_counted_once():
+    store = Store(":memory:")
+    store.insert_range(146, 100, 200)
+    end = 1_700_000_000
+    boundary = end - 30 * 86400
+    items = [_make_valued(net_usd=Decimal("100"), timestamp=boundary, tx_hash="0xb")]
+    rep = generate_report(
+        chain_ids=[146], from_blocks={146: 100}, to_blocks={146: 200}, store=store,
+        valued_events={146: items}, validation_results={146: ValidationResult(146)},
+        eurusd=Decimal("1"), days=90, end_ts=end,
+    )
+    months = rep.chains[0].months
+    assert sum(m.event_count for m in months) == 1
+
+
+def test_months_are_anchored_at_window_end_not_last_event():
+    store = Store(":memory:")
+    store.insert_range(146, 100, 200)
+    end = 1_700_000_000
+    # Only event is 45 days before the window end: it belongs to the second month.
+    items = [_make_valued(net_usd=Decimal("100"), timestamp=end - 45 * 86400, tx_hash="0xm")]
+    rep = generate_report(
+        chain_ids=[146], from_blocks={146: 100}, to_blocks={146: 200}, store=store,
+        valued_events={146: items}, validation_results={146: ValidationResult(146)},
+        eurusd=Decimal("1"), days=90, end_ts=end,
+    )
+    counts = [m.event_count for m in sorted(rep.chains[0].months, key=lambda m: m.month_index)]
+    assert counts == [0, 1, 0]
+
+
+def test_last_fetched_block():
+    store = Store(":memory:")
+    assert store.last_fetched_block(146) is None
+    store.insert_range(146, 100, 200)
+    store.insert_range(146, 201, 350)
+    store.insert_range(42161, 1, 999)
+    assert store.last_fetched_block(146) == 350
