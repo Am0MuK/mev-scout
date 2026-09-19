@@ -1,6 +1,7 @@
 """Tests for Phase 2C cross-chain venue table and adapters."""
 
 import pytest
+from decimal import Decimal
 from mev_scout.xchain import (
     XCHAIN_TOKENS,
     XCHAIN_VENUES,
@@ -504,4 +505,356 @@ def test_check_moment_skew_guard():
     passes, skew = check_moment_skew(moment, chain_blocks_boundary)
     assert passes is True
     assert skew == 5
+
+
+def test_encode_and_get_l1_fee():
+    from mev_scout.xchain import (
+        encode_get_l1_fee,
+        get_l1_fee,
+        GAS_PRICE_ORACLE_ADDRESS,
+        GET_L1_FEE_SELECTOR,
+    )
+
+    # 1. Encoding check
+    calldata = encode_get_l1_fee(400)
+    assert calldata.startswith(GET_L1_FEE_SELECTOR)
+    assert GET_L1_FEE_SELECTOR == "0x49948e0e"
+    # Offset 32 (0x20)
+    assert calldata[10 : 10 + 64] == "0" * 62 + "20"
+    # Length 400 (0x190)
+    assert calldata[10 + 64 : 10 + 128] == "0" * 61 + "190"
+    # Padded data 416 bytes (832 hex chars)
+    assert len(calldata[10 + 128 :]) == 832
+
+    # 2. get_l1_fee for Arbitrum (42161) returns 0 without calling RPC
+    class FailRpc:
+        def call(self, *args, **kwargs):
+            raise AssertionError("Should not be called for Arbitrum")
+
+    assert get_l1_fee(FailRpc(), chain_id=42161, block=123) == 0
+
+    # 3. get_l1_fee for Base (8453) and Optimism (10)
+    class MockL1Rpc:
+        def __init__(self, fee_wei: int):
+            self.fee_wei = fee_wei
+            self.calls = []
+
+        def call(self, to: str, data: str, block: int | str):
+            self.calls.append((to.lower(), data, block))
+            return "0x" + hex(self.fee_wei)[2:].rjust(64, "0")
+
+    mock_base = MockL1Rpc(fee_wei=2_880_749_262)
+    fee_base = get_l1_fee(mock_base, chain_id=8453, block=1000)
+    assert fee_base == 2_880_749_262
+    assert mock_base.calls[0][0] == GAS_PRICE_ORACLE_ADDRESS.lower()
+    assert mock_base.calls[0][2] == 1000
+
+    mock_op = MockL1Rpc(fee_wei=4_678_797_641)
+    fee_op = get_l1_fee(mock_op, chain_id=10, block=2000)
+    assert fee_op == 4_678_797_641
+
+
+def test_get_base_fee_per_gas():
+    from mev_scout.xchain import get_base_fee_per_gas
+
+    class MockBlockFeeRpc:
+        def __init__(self, block_dict: dict):
+            self.block_dict = block_dict
+
+        def _call(self, method: str, params: list):
+            assert method == "eth_getBlockByNumber"
+            return self.block_dict
+
+    # Valid hex base fee: 0x3b9aca00 = 1 gwei
+    rpc = MockBlockFeeRpc({"number": "0x64", "baseFeePerGas": "0x3b9aca00"})
+    assert get_base_fee_per_gas(rpc, 100) == 1_000_000_000
+
+    # Missing base fee -> ValueError (no fallback)
+    rpc_missing = MockBlockFeeRpc({"number": "0x64"})
+    with pytest.raises(ValueError, match="no baseFeePerGas"):
+        get_base_fee_per_gas(rpc_missing, 100)
+
+    # Non-positive base fee -> ValueError (no fallback)
+    rpc_zero = MockBlockFeeRpc({"number": "0x64", "baseFeePerGas": "0x0"})
+    with pytest.raises(ValueError, match="non-positive"):
+        get_base_fee_per_gas(rpc_zero, 100)
+
+
+def test_decode_slot0_mid_price_and_prefilter():
+    from decimal import Decimal
+    from mev_scout.xchain import decode_slot0_weth_usdc_price, check_prefilter
+
+    # For WETH = 2600 USD:
+    # On Arbitrum/Base: WETH is token0 (18 dec), USDC is token1 (6 dec)
+    # price = (sqrtPriceX96 / 2^96)^2 * 10^12 = 2600
+    # sqrtPriceX96 = 2^96 * sqrt(2600 * 10^-12)
+    # 2600 * 10^-12 = 2.6e-9
+    # sqrt(2.6e-9) = 5.0990195135927845e-05
+    # 2^96 ~ 7.922816251426434e+28
+    # sqrtPriceX96 ~ 4.03986e+24
+    sqrt_arb = int((Decimal(2600) / Decimal(10**12)).sqrt() * Decimal(2**96))
+    slot0_arb = hex(sqrt_arb)[2:].rjust(64, "0") + "0" * 128
+    price_arb = decode_slot0_weth_usdc_price(42161, slot0_arb)
+    assert abs(price_arb - Decimal("2600")) < Decimal("0.01")
+
+    # On Optimism: USDC is token0 (6 dec), WETH is token1 (18 dec)
+    # price = (1 / (sqrtPriceX96 / 2^96)^2) * 10^12 = 2600
+    # sqrtPriceX96 = 2^96 * sqrt(10^12 / 2600)
+    sqrt_op = int((Decimal(10**12) / Decimal(2600)).sqrt() * Decimal(2**96))
+    slot0_op = hex(sqrt_op)[2:].rjust(64, "0") + "0" * 128
+    price_op = decode_slot0_weth_usdc_price(10, slot0_op)
+    assert abs(price_op - Decimal("2600")) < Decimal("0.01")
+
+    # Prefilter check:
+    # Arbitrum fee = 500 (0.05%), Base fee = 100 (0.01%)
+    # Total fee = 0.06% = 0.0006
+    # rebalance_pct = 0.05% = 0.0005
+    # Threshold = 0.0011 (11 bps)
+    # Case 1: Gap = 8 bps (below threshold) -> passes = False
+    p_cheaper = Decimal("2600.00")
+    p_dearer_narrow = Decimal("2602.08")  # gap = 2.08 / 2600 = 0.0008 = 8 bps
+    passes, gap, threshold = check_prefilter(
+        price_a=p_cheaper,
+        fee_a=500,
+        price_b=p_dearer_narrow,
+        fee_b=100,
+        rebalance_pct=Decimal("0.0005"),
+    )
+    assert passes is False
+    assert threshold == Decimal("0.0011")
+
+    # Case 2: Gap = exactly threshold (11 bps) -> boundary exact: skip
+    p_dearer_exact = p_cheaper * (Decimal("1") + threshold)
+    passes, gap, _ = check_prefilter(
+        price_a=p_cheaper,
+        fee_a=500,
+        price_b=p_dearer_exact,
+        fee_b=100,
+        rebalance_pct=Decimal("0.0005"),
+    )
+    assert passes is False
+
+    # Case 3: Gap = 20 bps (above threshold) -> passes = True
+    p_dearer_wide = p_cheaper * Decimal("1.0020")
+    passes, gap, _ = check_prefilter(
+        price_a=p_cheaper,
+        fee_a=500,
+        price_b=p_dearer_wide,
+        fee_b=100,
+        rebalance_pct=Decimal("0.0005"),
+    )
+    assert passes is True
+
+
+def test_get_best_quotes_and_rejection():
+    from mev_scout.xchain import (
+        XChainPool,
+        get_best_buy_quote,
+        get_best_sell_quote,
+    )
+    from mev_scout.rpc import ContractCallError
+
+    # Pools on Base
+    pool_deep = XChainPool(
+        chain_id=8453,
+        venue_name="uniswap_v3",
+        address="0x1111111111111111111111111111111111111111",
+        token0="0x4200000000000000000000000000000000000006",
+        token1="0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        pool_key=500,
+        adapter_type="uniswap_v3",
+        factory="0x33128a8fc17869897dce68ed026d694621f6fdfd",
+    )
+    pool_shallow = XChainPool(
+        chain_id=8453,
+        venue_name="uniswap_v3",
+        address="0x2222222222222222222222222222222222222222",
+        token0="0x4200000000000000000000000000000000000006",
+        token1="0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        pool_key=100,
+        adapter_type="uniswap_v3",
+        factory="0x33128a8fc17869897dce68ed026d694621f6fdfd",
+    )
+    pool_reverting = XChainPool(
+        chain_id=8453,
+        venue_name="uniswap_v3",
+        address="0x3333333333333333333333333333333333333333",
+        token0="0x4200000000000000000000000000000000000006",
+        token1="0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        pool_key=3000,
+        adapter_type="uniswap_v3",
+        factory="0x33128a8fc17869897dce68ed026d694621f6fdfd",
+    )
+
+    class MockQuoterRpc:
+        def call(self, to: str, data: str, block: int | str):
+            # Parse pool key or amount to distinguish
+            fee = int(data[10 + 192 : 10 + 256], 16)
+            amt_in = int(data[10 + 128 : 10 + 192], 16)
+
+            if fee == 3000:
+                raise ContractCallError("execution reverted")
+
+            if fee == 100:
+                # Shallow pool: 1x gives absurd high quote, 10x drops by 50%
+                if amt_in < 50_000 * 10**6:  # 1x for 10k
+                    out = int(4.0 * 10**18)
+                else:  # 10x
+                    out = int(20.0 * 10**18)  # 2.0 per 10k -> 50% drop
+                gas = 120_000
+                res = (
+                    hex(out)[2:].rjust(64, "0")
+                    + "0" * 128
+                    + hex(gas)[2:].rjust(64, "0")
+                )
+                return "0x" + res
+
+            if fee == 500:
+                # Deep pool: 1x gives 3.84 WETH, 10x gives 38.3 WETH (drop = 0.26% <= 2%)
+                if amt_in < 50_000 * 10**6:
+                    out = int(3.84 * 10**18)
+                else:
+                    out = int(38.3 * 10**18)
+                gas = 110_000
+                res = (
+                    hex(out)[2:].rjust(64, "0")
+                    + "0" * 128
+                    + hex(gas)[2:].rjust(64, "0")
+                )
+                return "0x" + res
+
+            raise ValueError("unknown call")
+
+    rpc = MockQuoterRpc()
+    # Buy quote for 10k USD:
+    # pool_shallow gives 4.0 WETH (higher than 3.84) but fails shallow check
+    # pool_reverting reverts and is skipped
+    # pool_deep passes shallow check and is chosen!
+    best_buy = get_best_buy_quote(
+        rpc=rpc,
+        chain_id=8453,
+        block=100,
+        pools=[pool_shallow, pool_reverting, pool_deep],
+        size_usd=Decimal("10000"),
+    )
+    assert best_buy is not None
+    assert best_buy.pool.address == pool_deep.address
+    assert best_buy.amount_out == int(3.84 * 10**18)
+    assert best_buy.gas_estimate == 110_000
+
+
+def test_evaluate_cross_chain_gap():
+    from mev_scout.xchain import (
+        XChainPool,
+        evaluate_cross_chain_gap,
+        XChainOpportunity,
+    )
+
+    # Chain 42161 (Arbitrum, cheaper): buy WETH with USDC
+    pool_arb = XChainPool(
+        chain_id=42161,
+        venue_name="uniswap_v3",
+        address="0xc6962004f452be9203591991d15f6b388e09e8d0",
+        token0="0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+        token1="0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+        pool_key=500,
+        adapter_type="uniswap_v3",
+        factory="0x1f98431c8ad98523631ae4a59f267346ea31f984",
+    )
+
+    # Chain 8453 (Base, dearer): sell WETH for USDC
+    pool_base = XChainPool(
+        chain_id=8453,
+        venue_name="uniswap_v3",
+        address="0xb4cb800922cc596700c50d4f3b64c12ea85fa8ce",
+        token0="0x4200000000000000000000000000000000000006",
+        token1="0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        pool_key=100,
+        adapter_type="uniswap_v3",
+        factory="0x33128a8fc17869897dce68ed026d694621f6fdfd",
+    )
+
+    class MockArbRpc:
+        def _call(self, method: str, params: list):
+            if method == "eth_getBlockByNumber":
+                # Arbitrum base fee = 0.1 gwei = 100,000,000 wei
+                return {"number": params[0], "baseFeePerGas": "0x5f5e100"}
+            raise ValueError(f"unknown method {method}")
+
+        def call(self, to: str, data: str, block: int | str):
+            # Arbitrum buy quote: 10,000 USDC -> 3.846153846153846153 WETH
+            # 10x gives 38.4 WETH
+            amt_in = int(data[10 + 128 : 10 + 192], 16)
+            if amt_in < 50_000 * 10**6:
+                out = 3846153846153846153
+            else:
+                out = 38461538461538461530
+            gas = 130_000
+            res = hex(out)[2:].rjust(64, "0") + "0" * 128 + hex(gas)[2:].rjust(64, "0")
+            return "0x" + res
+
+    class MockBaseRpc:
+        def _call(self, method: str, params: list):
+            if method == "eth_getBlockByNumber":
+                # Base base fee = 0.05 gwei = 50,000,000 wei
+                return {"number": params[0], "baseFeePerGas": "0x2faf080"}
+            raise ValueError(f"unknown method {method}")
+
+        def call(self, to: str, data: str, block: int | str):
+            if to.lower() == "0x420000000000000000000000000000000000000f":
+                # Base L1 fee: 2,880,749,262 wei
+                return "0x" + hex(2_880_749_262)[2:].rjust(64, "0")
+
+            # Base sell quote: sell 3.846153846153846153 WETH -> 10,120.00 USDC
+            # 10x gives 101,150.00 USDC
+            amt_in = int(data[10 + 128 : 10 + 192], 16)
+            if amt_in < 10 * 10**18:
+                out = 10120 * 10**6
+            else:
+                out = 101150 * 10**6
+            gas = 120_000
+            res = hex(out)[2:].rjust(64, "0") + "0" * 128 + hex(gas)[2:].rjust(64, "0")
+            return "0x" + res
+
+    opp = evaluate_cross_chain_gap(
+        moment=1700000000,
+        chain_buy=42161,
+        chain_sell=8453,
+        block_buy=1000,
+        block_sell=2000,
+        rpc_buy=MockArbRpc(),
+        rpc_sell=MockBaseRpc(),
+        pools_buy=[pool_arb],
+        pools_sell=[pool_base],
+        size_usd=Decimal("10000"),
+        mid_price_buy=Decimal("2600.00"),
+        mid_price_sell=Decimal("2631.20"),
+        rebalance_pct=Decimal("0.0005"),
+        rebalance_fixed_usd=Decimal("1.00"),
+    )
+
+    assert isinstance(opp, XChainOpportunity)
+    assert opp.moment == 1700000000
+    assert opp.chain_buy == 42161
+    assert opp.chain_sell == 8453
+    assert opp.size_usd == Decimal("10000")
+    # Gross profit: 10,120.00 - 10,000.00 = 120.00 USD
+    assert opp.gross_usd == Decimal("120.00")
+    # Gap: 120 / 10000 = 0.012 = 1.2%
+    assert opp.gap_pct == Decimal("0.012")
+
+    # Gas:
+    # Buy (Arbitrum): (130k + 100k) * 100,000,000 wei = 2.3e13 wei = 0.000023 ETH * 2600 = $0.0598
+    # Sell (Base): (120k + 100k) * 50,000,000 wei = 1.1e13 wei + 2,880,749,262 wei = 13,880,749,262 wei
+    #   ETH = 0.000013880749262 * 2631.20 = $0.0365230224581744
+    # Total gas: ~ $0.0963
+    assert abs(opp.gas_usd - Decimal("0.0963")) < Decimal("0.01")
+
+    # Rebalance: 10,000 * 0.0005 + 1.00 = 5.00 + 1.00 = 6.00 USD
+    assert opp.rebalance_usd == Decimal("6.00")
+
+    # Net: 120.00 - gas_usd - 6.00 ~ 113.90 USD
+    assert opp.net_usd > Decimal("110.00")
+    assert opp.is_opportunity is True
+
 

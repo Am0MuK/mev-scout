@@ -172,8 +172,31 @@ XCHAIN_VENUES: list[VenueConfig] = [
     ),
 ]
 
+VENUE_BY_NAME: dict[tuple[int, str], VenueConfig] = {
+    (v.chain_id, v.name): v for v in XCHAIN_VENUES
+}
+
+GAS_PRICE_ORACLE_ADDRESS = OP_GAS_ORACLE
+DEFAULT_REBALANCE_PCT = Decimal("0.0005")  # 0.05%
+DEFAULT_REBALANCE_FIXED_USD = Decimal("1.00")
+OVERHEAD_GAS = 100_000
+XCHAIN_SIZES_USD = (Decimal("1000"), Decimal("10000"), Decimal("50000"))
+
+CANONICAL_DEEPEST_POOLS = {
+    42161: "0xc6962004f452be9203591991d15f6b388e09e8d0",  # Uniswap V3 fee 500
+    8453: "0xb4cb800922cc596700c50d4f3b64c12ea85fa8ce",   # Uniswap V3 fee 100
+    10: "0xc1738d90c0f3056157f44d8525b642674e2d2740",     # Uniswap V3 fee 3000
+}
+
+DEEPEST_POOL_FEES = {
+    42161: 500,
+    8453: 100,
+    10: 3000,
+}
+
 
 @dataclass(frozen=True)
+
 class XChainPool:
     chain_id: int
     venue_name: str
@@ -183,7 +206,7 @@ class XChainPool:
     pool_key: Any  # fee (int), tickSpacing (int), or stable (bool)
     adapter_type: str
     factory: str
-    quoter: str | None
+    quoter: str | None = None
 
 
 def _clean_addr(addr: str) -> str:
@@ -511,4 +534,350 @@ def check_moment_skew(
 
     skew = max(timestamps) - min(timestamps)
     return True, skew
+
+
+@dataclass(frozen=True)
+class BestQuoteResult:
+    amount_out: int
+    gas_estimate: int
+    pool: XChainPool
+
+
+@dataclass
+class XChainOpportunity:
+    moment: int
+    chain_buy: int
+    chain_sell: int
+    block_buy: int
+    block_sell: int
+    pool_buy: str
+    pool_sell: str
+    size_usd: Decimal
+    gross_usd: Decimal
+    gas_usd: Decimal
+    rebalance_usd: Decimal
+    net_usd: Decimal
+    gap_pct: Decimal
+    is_opportunity: bool
+    persisted_next_block: bool | None = None
+    persisted_1m: bool | None = None
+    persisted_5m: bool | None = None
+
+
+def encode_get_l1_fee(data_len: int = 400) -> str:
+    """Encode GasPriceOracle.getL1Fee(bytes) call with dynamic byte payload."""
+    offset = hex(32).removeprefix("0x").rjust(64, "0")
+    length = hex(data_len).removeprefix("0x").rjust(64, "0")
+    pad_len = ((data_len + 31) // 32) * 32
+    payload = "00" * pad_len
+    return f"{GET_L1_FEE_SELECTOR}{offset}{length}{payload}"
+
+
+def get_l1_fee(rpc: RpcClient, chain_id: int, block: int | str) -> int:
+    """Get L1 data fee in wei via GasPriceOracle on Base (8453) and Optimism (10).
+
+    Arbitrum (42161) incorporates L1 data fee into L2 baseFee; returns 0.
+    """
+    if chain_id not in (8453, 10):
+        return 0
+    calldata = encode_get_l1_fee(400)
+    res = rpc.call(GAS_PRICE_ORACLE_ADDRESS, calldata, block)
+    clean = res.removeprefix("0x").removeprefix("0X")
+    if not clean:
+        raise ValueError(f"Empty L1 fee response on chain {chain_id} block {block}")
+    return int(clean, 16)
+
+
+def get_base_fee_per_gas(rpc: RpcClient, block: int | str) -> int:
+    """Read baseFeePerGas in wei from block header.
+
+    Never falls back to a default value.
+    """
+    block_tag = hex(block) if isinstance(block, int) else str(block)
+    block_obj = rpc._call("eth_getBlockByNumber", [block_tag, False])
+    if not isinstance(block_obj, dict) or block_obj.get("baseFeePerGas") is None:
+        raise ValueError(f"Block {block} has no baseFeePerGas")
+    base_fee_raw = block_obj["baseFeePerGas"]
+    base_fee = int(str(base_fee_raw), 0)
+    if base_fee <= 0:
+        raise ValueError(f"Block {block} has non-positive baseFeePerGas: {base_fee}")
+    return base_fee
+
+
+def decode_slot0_weth_usdc_price(chain_id: int, slot0_hex: str) -> Decimal:
+    """Decode slot0 sqrtPriceX96 to WETH price in USDC (USD).
+
+    Accounts for token ordering per chain:
+    - Arbitrum (42161) & Base (8453): WETH (18 dec) is token0, USDC (6 dec) is token1.
+    - Optimism (10): USDC (6 dec) is token0, WETH (18 dec) is token1.
+    """
+    clean = slot0_hex.removeprefix("0x").removeprefix("0X")
+    if len(clean) < 64:
+        raise ValueError(f"Invalid slot0 result length: {len(clean)}")
+    sqrt_p = int(clean[0:64], 16)
+    if sqrt_p <= 0:
+        raise ValueError(f"Invalid sqrtPriceX96: {sqrt_p}")
+    ratio = Decimal(sqrt_p) / Decimal(2**96)
+    ratio_sq = ratio * ratio
+
+    if chain_id in (42161, 8453):
+        return ratio_sq * Decimal(10**12)
+    elif chain_id == 10:
+        return (Decimal(1) / ratio_sq) * Decimal(10**12)
+    else:
+        raise ValueError(f"Unknown chain_id for mid price: {chain_id}")
+
+
+def check_prefilter(
+    price_a: Decimal,
+    fee_a: int,
+    price_b: Decimal,
+    fee_b: int,
+    rebalance_pct: Decimal = DEFAULT_REBALANCE_PCT,
+) -> tuple[bool, Decimal, Decimal]:
+    """Check slot0 mid-price gap against fee sum + rebalancing cost.
+
+    Returns (passes, gap, threshold).
+    Boundary exact: equal gap = skip (passes=False).
+    """
+    if price_a <= 0 or price_b <= 0:
+        return False, Decimal("0"), Decimal("0")
+
+    if price_a <= price_b:
+        p_cheaper, p_dearer = price_a, price_b
+    else:
+        p_cheaper, p_dearer = price_b, price_a
+
+    gap = (p_dearer - p_cheaper) / p_cheaper
+    threshold = (Decimal(fee_a + fee_b) / Decimal("1000000")) + rebalance_pct
+    return (gap > threshold), gap, threshold
+
+
+def _get_quote_target(pool: XChainPool) -> str:
+    if pool.adapter_type == "aerodrome_classic":
+        return pool.address
+    if pool.quoter is not None:
+        return pool.quoter
+    venue = VENUE_BY_NAME.get((pool.chain_id, pool.venue_name))
+    if venue is not None and venue.quoter is not None:
+        return venue.quoter
+    raise ValueError(f"No quoter found for venue {pool.venue_name} on chain {pool.chain_id}")
+
+
+def get_best_buy_quote(
+    rpc: RpcClient,
+    chain_id: int,
+    block: int,
+    pools: list[XChainPool],
+    size_usd: Decimal,
+    counters: dict[str, int] | None = None,
+) -> BestQuoteResult | None:
+    """Find best executable buy quote (USDC -> WETH) across discovered pools.
+
+    Requires 10x shallow check. Reverts (ContractCallError) are skipped and counted.
+    """
+    if size_usd <= Decimal("0") or not pools:
+        return None
+
+    amount_in = int(size_usd * Decimal("1000000"))
+    token_in = XCHAIN_TOKENS[chain_id]["USDC"].address
+    token_out = XCHAIN_TOKENS[chain_id]["WETH"].address
+
+    candidates: list[BestQuoteResult] = []
+    for pool in pools:
+        target = _get_quote_target(pool)
+        calldata_1x = encode_quote(pool.adapter_type, token_in, token_out, amount_in, pool.pool_key)
+        calldata_10x = encode_quote(pool.adapter_type, token_in, token_out, 10 * amount_in, pool.pool_key)
+
+        try:
+            res_1x = rpc.call(target, calldata_1x, block)
+        except ContractCallError:
+            if counters is not None:
+                counters["reverts"] = counters.get("reverts", 0) + 1
+            continue
+
+        try:
+            res_10x = rpc.call(target, calldata_10x, block)
+        except ContractCallError:
+            if counters is not None:
+                counters["reverts"] = counters.get("reverts", 0) + 1
+            continue
+
+        try:
+            out_1x, gas_1x = decode_quote(pool.adapter_type, res_1x)
+            out_10x, _ = decode_quote(pool.adapter_type, res_10x)
+        except (ValueError, IndexError):
+            if counters is not None:
+                counters["unpriced"] = counters.get("unpriced", 0) + 1
+            continue
+
+        if out_1x <= 0 or out_10x <= 0:
+            continue
+
+        if is_shallow_quote(amount_in, out_1x, out_10x):
+            if counters is not None:
+                counters["shallow"] = counters.get("shallow", 0) + 1
+            continue
+
+        candidates.append(BestQuoteResult(amount_out=out_1x, gas_estimate=gas_1x, pool=pool))
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda c: c.amount_out)
+
+
+def get_best_sell_quote(
+    rpc: RpcClient,
+    chain_id: int,
+    block: int,
+    pools: list[XChainPool],
+    amount_in_weth: int,
+    counters: dict[str, int] | None = None,
+) -> BestQuoteResult | None:
+    """Find best executable sell quote (WETH -> USDC) across discovered pools.
+
+    Requires 10x shallow check. Reverts (ContractCallError) are skipped and counted.
+    """
+    if amount_in_weth <= 0 or not pools:
+        return None
+
+    token_in = XCHAIN_TOKENS[chain_id]["WETH"].address
+    token_out = XCHAIN_TOKENS[chain_id]["USDC"].address
+
+    candidates: list[BestQuoteResult] = []
+    for pool in pools:
+        target = _get_quote_target(pool)
+        calldata_1x = encode_quote(pool.adapter_type, token_in, token_out, amount_in_weth, pool.pool_key)
+        calldata_10x = encode_quote(pool.adapter_type, token_in, token_out, 10 * amount_in_weth, pool.pool_key)
+
+        try:
+            res_1x = rpc.call(target, calldata_1x, block)
+        except ContractCallError:
+            if counters is not None:
+                counters["reverts"] = counters.get("reverts", 0) + 1
+            continue
+
+        try:
+            res_10x = rpc.call(target, calldata_10x, block)
+        except ContractCallError:
+            if counters is not None:
+                counters["reverts"] = counters.get("reverts", 0) + 1
+            continue
+
+        try:
+            out_1x, gas_1x = decode_quote(pool.adapter_type, res_1x)
+            out_10x, _ = decode_quote(pool.adapter_type, res_10x)
+        except (ValueError, IndexError):
+            if counters is not None:
+                counters["unpriced"] = counters.get("unpriced", 0) + 1
+            continue
+
+        if out_1x <= 0 or out_10x <= 0:
+            continue
+
+        if is_shallow_quote(amount_in_weth, out_1x, out_10x):
+            if counters is not None:
+                counters["shallow"] = counters.get("shallow", 0) + 1
+            continue
+
+        candidates.append(BestQuoteResult(amount_out=out_1x, gas_estimate=gas_1x, pool=pool))
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda c: c.amount_out)
+
+
+def evaluate_cross_chain_gap(
+    moment: int,
+    chain_buy: int,
+    chain_sell: int,
+    block_buy: int,
+    block_sell: int,
+    rpc_buy: RpcClient,
+    rpc_sell: RpcClient,
+    pools_buy: list[XChainPool],
+    pools_sell: list[XChainPool],
+    size_usd: Decimal,
+    mid_price_buy: Decimal,
+    mid_price_sell: Decimal,
+    rebalance_pct: Decimal = DEFAULT_REBALANCE_PCT,
+    rebalance_fixed_usd: Decimal = DEFAULT_REBALANCE_FIXED_USD,
+    counters: dict[str, int] | None = None,
+) -> XChainOpportunity | None:
+    """Evaluate cross-chain arbitrage gap and profitability for an ordered chain pair.
+
+    1. Buy WETH on chain_buy with size_usd USDC.
+    2. Sell WETH received on chain_sell for USDC.
+    3. Compute gas costs per leg (quoter gasEstimate + 100k at base fee; L1 fee on Base/Optimism).
+    4. Compute rebalance cost (rebalance_pct * size_usd + rebalance_fixed_usd).
+    """
+    buy_quote = get_best_buy_quote(
+        rpc=rpc_buy,
+        chain_id=chain_buy,
+        block=block_buy,
+        pools=pools_buy,
+        size_usd=size_usd,
+        counters=counters,
+    )
+    if buy_quote is None:
+        if counters is not None:
+            counters["unpriced"] = counters.get("unpriced", 0) + 1
+        return None
+
+    sell_quote = get_best_sell_quote(
+        rpc=rpc_sell,
+        chain_id=chain_sell,
+        block=block_sell,
+        pools=pools_sell,
+        amount_in_weth=buy_quote.amount_out,
+        counters=counters,
+    )
+    if sell_quote is None:
+        if counters is not None:
+            counters["unpriced"] = counters.get("unpriced", 0) + 1
+        return None
+
+    amount_in_usdc = int(size_usd * Decimal("1000000"))
+    gross_profit_raw = sell_quote.amount_out - amount_in_usdc
+    gross_usd = Decimal(gross_profit_raw) / Decimal("1000000")
+    gap_pct = Decimal(gross_profit_raw) / Decimal(amount_in_usdc)
+
+    # Leg 1 Gas (Buy)
+    base_fee_buy = get_base_fee_per_gas(rpc_buy, block_buy)
+    l1_fee_buy = get_l1_fee(rpc_buy, chain_buy, block_buy)
+    gas_units_buy = buy_quote.gas_estimate + OVERHEAD_GAS
+    gas_wei_buy = (gas_units_buy * base_fee_buy) + l1_fee_buy
+    gas_eth_buy = Decimal(gas_wei_buy) / Decimal(10**18)
+    gas_usd_buy = gas_eth_buy * mid_price_buy
+
+    # Leg 2 Gas (Sell)
+    base_fee_sell = get_base_fee_per_gas(rpc_sell, block_sell)
+    l1_fee_sell = get_l1_fee(rpc_sell, chain_sell, block_sell)
+    gas_units_sell = sell_quote.gas_estimate + OVERHEAD_GAS
+    gas_wei_sell = (gas_units_sell * base_fee_sell) + l1_fee_sell
+    gas_eth_sell = Decimal(gas_wei_sell) / Decimal(10**18)
+    gas_usd_sell = gas_eth_sell * mid_price_sell
+
+    gas_usd = gas_usd_buy + gas_usd_sell
+    rebalance_usd = (size_usd * rebalance_pct) + rebalance_fixed_usd
+    net_usd = gross_usd - gas_usd - rebalance_usd
+    is_opp = net_usd > Decimal("0")
+
+    return XChainOpportunity(
+        moment=moment,
+        chain_buy=chain_buy,
+        chain_sell=chain_sell,
+        block_buy=block_buy,
+        block_sell=block_sell,
+        pool_buy=buy_quote.pool.address,
+        pool_sell=sell_quote.pool.address,
+        size_usd=size_usd,
+        gross_usd=gross_usd,
+        gas_usd=gas_usd,
+        rebalance_usd=rebalance_usd,
+        net_usd=net_usd,
+        gap_pct=gap_pct,
+        is_opportunity=is_opp,
+    )
+
 
