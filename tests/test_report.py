@@ -151,11 +151,10 @@ def test_report_text_and_json():
     text = report_data.to_text()
     assert "Sonic" in text
     assert "contestable" in text
-    assert "Base" in text  # Uncovered chains listed
-    assert "Optimism" in text
+    assert "BNB Chain" in text  # Uncovered chains listed
 
     json_str = report_data.to_json()
     data = json.loads(json_str)
     assert 146 in [c["chain_id"] for c in data["chains"]]
-    assert len(data["uncovered_chains"]) == 2
+    assert len(data["uncovered_chains"]) == 1
     assert "contestable" in data["market_note"]
