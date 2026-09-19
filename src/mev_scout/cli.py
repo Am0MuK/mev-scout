@@ -117,7 +117,7 @@ def arb_pools_cmd(chain_id: int, db_path: str = "data/scout.db") -> None:
     store = Store(db_path)
     try:
         with httpx.Client(timeout=30.0) as http:
-            rpc = RpcClient(url=rpc_url, http=http)
+            rpc = RpcClient(url=rpc_url, http=http, max_calls_per_sec=_max_cps())
             pools = discover_pools(chain_id=chain_id, rpc=rpc)
             store.insert_pools(pools)
             print(f"Discovered {len(pools)} pools on chain {chain_id}:")
@@ -145,7 +145,7 @@ def arb_fetch_cmd(chain_id: int, days: int = 90, db_path: str = "data/scout.db")
     try:
         with httpx.Client(timeout=30.0) as http:
             explorer = create_log_source(chain=chain, http=http, api_key=api_key)
-            rpc = RpcClient(url=rpc_url, http=http)
+            rpc = RpcClient(url=rpc_url, http=http, max_calls_per_sec=_max_cps())
             fetch_swaps(chain_id=chain_id, days=days, explorer=explorer, rpc=rpc, store=store)
             print(f"Fetched swaps for chain {chain_id} over {days} days")
     finally:
@@ -183,7 +183,7 @@ def arb_census_cmd(
         raw_arbs = detect_arbitrages(swaps, pools=pools)
 
         with httpx.Client(timeout=30.0) as http:
-            rpc = RpcClient(url=rpc_url, http=http)
+            rpc = RpcClient(url=rpc_url, http=http, max_calls_per_sec=_max_cps())
             valued_arbs = value_arbitrages(raw_arbs, rpc=rpc, pools=pools, store=store, chain_id=chain_id)
             val_res = validate_arbitrages(valued_arbs, rpc=rpc)
 
@@ -232,7 +232,7 @@ def arb_sample_cmd(
     try:
         with httpx.Client(timeout=30.0) as http:
             explorer = create_log_source(chain=chain, http=http, api_key=api_key)
-            rpc = RpcClient(url=rpc_url, http=http)
+            rpc = RpcClient(url=rpc_url, http=http, max_calls_per_sec=_max_cps())
             meta = run_arb_sampling(
                 chain_id=chain_id,
                 days=days,
