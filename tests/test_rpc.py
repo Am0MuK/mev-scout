@@ -356,3 +356,23 @@ def test_backoff_is_exponential_and_long_enough_for_free_tier():
 def test_batch_size_is_small():
     from mev_scout import rpc as rpc_mod
     assert rpc_mod.BATCH_SIZE <= 25
+
+
+def test_client_side_rate_limit_spaces_requests():
+    # Alchemy free tier throttles by compute units per second; 25-call batches
+    # triggered endless 429s. The client paces itself instead.
+    clock = {"t": 0.0}
+    sleeps = []
+
+    def sleep(s):
+        sleeps.append(s)
+        clock["t"] += s
+
+    ok = lambda r: httpx.Response(200, json=[{"jsonrpc": "2.0", "id": i, "result": "0x01"} for i in range(1, 11)])
+    http = httpx.Client(transport=httpx.MockTransport(ok))
+    client = RpcClient("https://rpc.example.com/secret", http, sleep=sleep,
+                       max_calls_per_sec=10.0, clock=lambda: clock["t"])
+    client.batch_call([("0xto", "0x00", 1)] * 10)
+    client.batch_call([("0xto", "0x00", 1)] * 10)
+    # 10 calls at 10/s = 1 s budget per batch: the second batch waits ~1 s.
+    assert sum(sleeps) >= 0.99
