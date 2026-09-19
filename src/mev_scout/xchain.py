@@ -1053,6 +1053,9 @@ def generate_xchain_report(
     to_ts: int = 0,
 ) -> XChainReport:
     """Aggregate opportunities per chain pair and size, compute RoC, and determine verdict."""
+    if total_moments <= 0:
+        # A report over nothing is not "no opportunities"; the sampling did not run.
+        raise ValueError("no sampled moments: run xchain-sample first (or it failed)")
     by_pair_size: dict[tuple[str, Decimal], list[XChainOpportunity]] = {}
     for o in opportunities:
         pair_key = f"{o.chain_buy}-{o.chain_sell}"
@@ -1207,7 +1210,7 @@ def run_xchain_sample(
         if stored:
             pools[cid] = stored
         else:
-            discovered = discover_xchain_pools(rpcs[cid], cid)
+            discovered = discover_xchain_pools(cid, rpcs[cid])
             store.insert_xchain_pools(discovered)
             pools[cid] = discovered
 

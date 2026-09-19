@@ -1029,8 +1029,8 @@ def test_xchain_sample_and_report_cli(tmp_path, monkeypatch):
     monkeypatch.setattr("sys.stdout", stdout_capture)
     with pytest.raises(SystemExit) as exc_info:
         main(["xchain-report", "--eurusd", "1.10", "--db", db_file])
-    assert exc_info.value.code == 0
-    assert "Phase 2C — Cross-Chain Inventory Arbitrage Census" in stdout_capture.getvalue()
+    # Nothing was sampled: the report must fail, not print a clean-looking zero.
+    assert exc_info.value.code == 2
 
 
 def test_run_xchain_sample_and_resume(tmp_path):
@@ -1183,3 +1183,29 @@ def test_verdict_counts_months_not_one_average():
                                  eurusd=_D("1"), from_ts=end - 60 * 86400, to_ts=end)
     assert rep.overall_verdict == "FAIL"
     assert "1 of 2 months" in rep.overall_verdict_reason
+
+
+def test_run_xchain_sample_passes_chain_id_then_rpc_to_pool_discovery(monkeypatch, tmp_path):
+    # Live: the first real run failed with "Chain <RpcClient object> not supported"
+    # because run_xchain_sample swapped the arguments; no test called it.
+    from mev_scout import xchain as xc
+    from mev_scout.store import Store
+    seen = []
+
+    def fake_discover(chain_id, rpc, venues=None):
+        seen.append((chain_id, rpc))
+        raise RuntimeError("stop after discovery")
+    monkeypatch.setattr(xc, "discover_xchain_pools", fake_discover)
+    rpcs = {42161: object(), 8453: object(), 10: object()}
+    import pytest as _p
+    with _p.raises(RuntimeError, match="stop after discovery"):
+        xc.run_xchain_sample(rpcs=rpcs, store=Store(str(tmp_path / "x.db")), days=1, every_min=60, now_ts=1_700_000_000)
+    assert isinstance(seen[0][0], int) and seen[0][1] is rpcs[seen[0][0]]
+
+
+def test_report_with_zero_sampled_moments_is_an_error():
+    from decimal import Decimal as _D
+    from mev_scout.xchain import generate_xchain_report
+    import pytest as _p
+    with _p.raises(ValueError, match="no sampled moments"):
+        generate_xchain_report([], total_moments=0, days=7, eurusd=_D("1"))
