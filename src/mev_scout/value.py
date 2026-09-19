@@ -7,7 +7,7 @@ from typing import Any
 
 from mev_scout.chains import CHAINS, ConfigError
 from mev_scout.decode import Liquidation
-from mev_scout.rpc import ContractCallError, RpcClient
+from mev_scout.rpc import BATCH_SIZE, ContractCallError, RpcClient
 from mev_scout.store import Store
 
 ADDRESSES_PROVIDER_SELECTOR = "0x0542975c"
@@ -75,6 +75,21 @@ def get_cached_decimals(
     return dec
 
 
+def _prefetch_calls(calls, batch_fn, store: Store, chain_id: int) -> None:
+    """Run eth_calls in chunks and cache each chunk as soon as it returns.
+
+    Caching per chunk means a failure late in a long prefetch keeps everything read
+    before it, and progress is visible in the store while a run is going.
+    """
+    for i in range(0, len(calls), BATCH_SIZE):
+        chunk = calls[i : i + BATCH_SIZE]
+        for (to, data, b), res in zip(chunk, batch_fn(chunk)):
+            if isinstance(res, ContractCallError):
+                store.set_call_cache(chain_id, to, data, b, f"REVERT:{res}")
+            elif isinstance(res, str):
+                store.set_call_cache(chain_id, to, data, b, res)
+
+
 def _prefetch_events(
     events: list[Liquidation],
     chain_id: int,
@@ -129,12 +144,7 @@ def _prefetch_events(
     ]
     if missing_provider_blocks:
         prov_calls = [(pool, ADDRESSES_PROVIDER_SELECTOR, b) for b in missing_provider_blocks]
-        prov_results = batch_fn(prov_calls)
-        for b, res in zip(missing_provider_blocks, prov_results):
-            if isinstance(res, ContractCallError):
-                store.set_call_cache(chain_id, pool, ADDRESSES_PROVIDER_SELECTOR, b, f"REVERT:{res}")
-            elif isinstance(res, str):
-                store.set_call_cache(chain_id, pool, ADDRESSES_PROVIDER_SELECTOR, b, res)
+        _prefetch_calls(prov_calls, batch_fn, store, chain_id)
 
     # 3. Pre-fetch provider.getPriceOracle() for unique blocks
     missing_oracle_blocks = []
@@ -147,12 +157,7 @@ def _prefetch_events(
                 missing_oracle_blocks.append((b, prov))
                 oracle_calls.append((prov, PRICE_ORACLE_SELECTOR, b))
     if oracle_calls:
-        oracle_results = batch_fn(oracle_calls)
-        for (b, prov), res in zip(missing_oracle_blocks, oracle_results):
-            if isinstance(res, ContractCallError):
-                store.set_call_cache(chain_id, prov, PRICE_ORACLE_SELECTOR, b, f"REVERT:{res}")
-            elif isinstance(res, str):
-                store.set_call_cache(chain_id, prov, PRICE_ORACLE_SELECTOR, b, res)
+        _prefetch_calls(oracle_calls, batch_fn, store, chain_id)
 
     # 4. Pre-fetch oracle calls: BASE_CURRENCY_UNIT and getAssetPrice
     oracle_query_calls = []
@@ -197,12 +202,7 @@ def _prefetch_events(
             oracle_query_calls.append((oracle, d_data, b))
 
     if oracle_query_calls:
-        query_results = batch_fn(oracle_query_calls)
-        for (to, data, b), res in zip(oracle_query_calls, query_results):
-            if isinstance(res, ContractCallError):
-                store.set_call_cache(chain_id, to, data, b, f"REVERT:{res}")
-            elif isinstance(res, str):
-                store.set_call_cache(chain_id, to, data, b, res)
+        _prefetch_calls(oracle_query_calls, batch_fn, store, chain_id)
 
 
 def value_liquidation(

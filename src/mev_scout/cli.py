@@ -33,6 +33,11 @@ from mev_scout.validate import validate_chain
 from mev_scout.value import DEFAULT_FLASH_FEE, DEFAULT_SWAP_COST, value_events
 
 
+
+def _max_cps() -> float:
+    """Client-side RPC pacing; 10 calls/s stays under Alchemy's free-tier compute-unit rate."""
+    return float(os.environ.get("MEVSCOUT_MAX_CPS", "10"))
+
 def _clean_error(err: Exception) -> str:
     msg = redact(str(err))
     for k, v in os.environ.items():
@@ -59,7 +64,7 @@ def fetch_cmd(chain_id: int, days: int, db_path: str) -> None:
     try:
         with httpx.Client(timeout=30.0) as http:
             explorer = create_log_source(chain=chain, http=http, api_key=api_key)
-            rpc = RpcClient(url=rpc_url, http=http)
+            rpc = RpcClient(url=rpc_url, http=http, max_calls_per_sec=_max_cps())
             fetch(chain_id=chain_id, days=days, explorer=explorer, rpc=rpc, store=store)
     finally:
         store.close()
@@ -85,7 +90,7 @@ def value_cmd(
             raise CoverageError(f"no fetched data for chain {chain_id}; run fetch first")
         events = store.get_liquidations(chain_id)
         with httpx.Client(timeout=30.0) as http:
-            rpc = RpcClient(url=rpc_url, http=http)
+            rpc = RpcClient(url=rpc_url, http=http, max_calls_per_sec=_max_cps())
             valued = value_events(
                 events=events,
                 chain_id=chain_id,
@@ -314,7 +319,7 @@ def report_cmd(
                 if not rpc_url:
                     raise ConfigError(f"{rpc_env} environment variable is required")
 
-                rpc = RpcClient(url=rpc_url, http=http)
+                rpc = RpcClient(url=rpc_url, http=http, max_calls_per_sec=_max_cps())
 
                 fb = explorer.block_by_time(cid, start_ts)
                 # The window ends at the last fetched block, not the live tip: on fast

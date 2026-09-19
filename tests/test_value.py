@@ -269,3 +269,24 @@ def test_value_events_batch_with_one_reverted_call_unprices_only_that_event():
     assert results[0].net_usd is not None
     assert results[1].unpriced is True
     assert results[1].net_usd is None
+
+
+def test_prefetch_caches_each_chunk_as_it_arrives(monkeypatch):
+    # A failure late in a long prefetch must not throw away what was already read.
+    from mev_scout import value as value_mod
+    store = Store(":memory:")
+    calls = [("0xpool", "0x0542975c", b) for b in range(60)]
+    seen = {"n": 0}
+
+    def batch_fn(chunk):
+        seen["n"] += 1
+        if seen["n"] == 2:
+            raise RpcError("HTTP 429 after retries")
+        return ["0x" + "0" * 24 + "1" * 40 for _ in chunk]
+
+    with pytest.raises(RpcError):
+        value_mod._prefetch_calls(calls, batch_fn, store, 146)
+    first = value_mod.BATCH_SIZE
+    assert store.get_call_cache(146, "0xpool", "0x0542975c", 0) is not None
+    assert store.get_call_cache(146, "0xpool", "0x0542975c", first - 1) is not None
+    assert store.get_call_cache(146, "0xpool", "0x0542975c", first) is None

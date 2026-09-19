@@ -37,11 +37,31 @@ def _is_revert(error: dict) -> bool:
 
 
 class RpcClient:
-    def __init__(self, url: str, http: httpx.Client, sleep=time.sleep):
+    def __init__(
+        self,
+        url: str,
+        http: httpx.Client,
+        sleep=time.sleep,
+        max_calls_per_sec: float | None = None,
+        clock=time.monotonic,
+    ):
         self.url = url
         self.http = http
         self._redacted_url = _redact_url(url)
         self._sleep = sleep
+        self._max_cps = max_calls_per_sec
+        self._clock = clock
+        self._next_allowed = 0.0
+
+    def _pace(self, n_calls: int) -> None:
+        """Client-side rate limit: space requests so n calls take n / max_calls_per_sec."""
+        if not self._max_cps:
+            return
+        now = self._clock()
+        if now < self._next_allowed:
+            self._sleep(self._next_allowed - now)
+            now = self._next_allowed
+        self._next_allowed = now + n_calls / self._max_cps
 
     def _clean(self, text: Any) -> str:
         s = str(text)
@@ -57,6 +77,7 @@ class RpcClient:
             if attempt:
                 self._sleep(BACKOFF_S * 2 ** (attempt - 1))
 
+            self._pace(len(payload) if isinstance(payload, list) else 1)
             try:
                 resp = self.http.post(self.url, json=payload)
             except httpx.HTTPError as exc:
@@ -136,6 +157,7 @@ class RpcClient:
             if attempt:
                 self._sleep(BACKOFF_S * 2 ** (attempt - 1))
 
+            self._pace(len(payload) if isinstance(payload, list) else 1)
             try:
                 resp = self.http.post(self.url, json=payload)
             except httpx.HTTPError as exc:
