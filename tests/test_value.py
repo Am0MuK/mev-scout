@@ -155,3 +155,117 @@ def test_zero_oracle_price_marks_event_unpriced_not_zero(which):
     results = value_events([_make_event()], chain_id=146, rpc=_setup_mock_rpc(**prices), store=store)
     assert results[0].unpriced is True
     assert results[0].net_usd is None
+
+
+def test_decimals_cache_ignores_block():
+    store = Store(":memory:")
+    # Pre-populate decimals cache at (chain_id, token)
+    store.set_decimals(146, "0xc011", 18)
+    store.set_decimals(146, "0xdeb7", 6)
+
+    rpc = _setup_mock_rpc()
+    # If decimals() selector is ever called, fail the test
+    original_call = rpc.call.side_effect
+
+    def failing_call(to, data, block):
+        if data == "0x313ce567":
+            raise AssertionError(f"decimals() called for {to} at block {block} despite being cached!")
+        return original_call(to, data, block)
+
+    rpc.call.side_effect = failing_call
+
+    # Value event at block 200
+    e = _make_event(block=200)
+    results = value_events([e], chain_id=146, rpc=rpc, store=store)
+    assert len(results) == 1
+    assert not results[0].unpriced
+    assert results[0].collateral_usd == Decimal("1100")
+
+
+def test_value_events_batch_with_one_reverted_call_unprices_only_that_event():
+    import httpx
+    from mev_scout.chains import CHAINS
+
+    # Two events: e1 with collateral 0xc011, e2 with collateral 0xbad0
+    e1 = _make_event(tx_hash="0x1", block=100)
+    e2 = Liquidation(
+        chain_id=146,
+        block=100,
+        timestamp=1700000000,
+        tx_hash="0x2",
+        log_index=0,
+        collateral="0xbad0",
+        debt="0xdeb7",
+        user="0xuser",
+        debt_to_cover=1000 * 10**6,
+        collateral_amount=1 * 10**18,
+        liquidator="0xliq",
+        receive_atoken=False,
+        gas_used=100000,
+        gas_price=10**9,
+    )
+
+    store = Store(":memory:")
+    store.set_decimals(146, "0xc011", 18)
+    store.set_decimals(146, "0xbad0", 18)
+    store.set_decimals(146, "0xdeb7", 6)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+        body = json.loads(request.read())
+        # If it's a batch
+        if isinstance(body, list):
+            responses = []
+            for item in body:
+                call_params = item["params"][0]
+                to = call_params["to"].lower()
+                data = call_params["data"].lower()
+                req_id = item["id"]
+
+                # Pool.ADDRESSES_PROVIDER -> 0x1111...
+                if data == "0x0542975c":
+                    res = "0x" + "0" * 24 + "11" * 20
+                    responses.append({"jsonrpc": "2.0", "id": req_id, "result": res})
+                # provider.getPriceOracle -> 0x2222...
+                elif data == "0xfca513a8":
+                    res = "0x" + "0" * 24 + "22" * 20
+                    responses.append({"jsonrpc": "2.0", "id": req_id, "result": res})
+                # oracle.BASE_CURRENCY_UNIT -> 1e8
+                elif data == "0x8c89b64f":
+                    responses.append({"jsonrpc": "2.0", "id": req_id, "result": hex(10**8)})
+                # Decimals
+                elif data == "0x313ce567":
+                    responses.append({"jsonrpc": "2.0", "id": req_id, "result": hex(18)})
+                # getAssetPrice
+                elif data.startswith("0xb3596f07"):
+                    if "bad0" in data:
+                        # Revert for 0xbad0!
+                        responses.append({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "error": {"code": 3, "message": "execution reverted: price not found"},
+                        })
+                    elif "c011" in data:
+                        responses.append({"jsonrpc": "2.0", "id": req_id, "result": hex(1100 * 10**8)})
+                    elif "deb7" in data:
+                        responses.append({"jsonrpc": "2.0", "id": req_id, "result": hex(1 * 10**8)})
+                    else:
+                        # native
+                        responses.append({"jsonrpc": "2.0", "id": req_id, "result": hex(2 * 10**8)})
+                else:
+                    responses.append({"jsonrpc": "2.0", "id": req_id, "result": "0x00"})
+            return httpx.Response(200, json=responses)
+
+        # Single call fallback
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": "0x00"})
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    from mev_scout.rpc import RpcClient
+    rpc = RpcClient("https://rpc.sonic.example.com/secret", http, sleep=lambda s: None)
+
+    results = value_events([e1, e2], chain_id=146, rpc=rpc, store=store)
+    assert len(results) == 2
+    assert results[0].unpriced is False
+    assert results[0].net_usd is not None
+    assert results[1].unpriced is True
+    assert results[1].net_usd is None

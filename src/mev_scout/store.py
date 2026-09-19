@@ -62,6 +62,16 @@ class Store:
                 )
                 """
             )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS decimals_cache (
+                    chain_id INTEGER NOT NULL,
+                    token_address TEXT NOT NULL,
+                    decimals INTEGER NOT NULL,
+                    PRIMARY KEY (chain_id, token_address)
+                )
+                """
+            )
 
     def insert_liquidations(self, items: list[Liquidation]) -> None:
         if not items:
@@ -227,6 +237,25 @@ class Store:
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 (chain_id, to_address.lower(), data.lower(), str(block).lower(), result),
+            )
+
+    def get_decimals(self, chain_id: int, token_address: str) -> int | None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT decimals FROM decimals_cache WHERE chain_id = ? AND token_address = ?",
+            (chain_id, token_address.lower()),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+    def set_decimals(self, chain_id: int, token_address: str, decimals: int) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO decimals_cache (chain_id, token_address, decimals)
+                VALUES (?, ?, ?)
+                """,
+                (chain_id, token_address.lower(), decimals),
             )
 
     def close(self) -> None:

@@ -75,3 +75,10 @@ def test_call_cache_round_trip(store):
     assert store.get_call_cache(146, "0xto", "0xdata", 100) is None
     store.set_call_cache(146, "0xto", "0xdata", 100, "0xresult")
     assert store.get_call_cache(146, "0xto", "0xdata", 100) == "0xresult"
+
+
+def test_decimals_cache_round_trip(store):
+    token = "0x039e2fb66102314ce7b64ce5ce3e5183bc94ad38"
+    assert store.get_decimals(146, token) is None
+    store.set_decimals(146, token.upper(), 18)
+    assert store.get_decimals(146, token.lower()) == 18
