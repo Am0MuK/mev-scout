@@ -44,7 +44,7 @@ def _make_valued(
     return ValuedLiquidation(
         event=ev,
         unpriced=False,
-        collateral_usd=debt_usd + net_usd + Decimal("10"),
+        collateral_usd=debt_usd * Decimal("1.05"),  # realistic 5% bonus; stays below the anomaly bound
         debt_usd=debt_usd,
         gross_usd=net_usd + Decimal("10"),
         gas_usd=Decimal("5"),
@@ -242,3 +242,26 @@ def test_last_fetched_block():
     store.insert_range(146, 201, 350)
     store.insert_range(42161, 1, 999)
     assert store.last_fetched_block(146) == 350
+
+
+def test_anomalous_liquidations_are_excluded_and_listed():
+    # Real case: KelpDAO rsETH hack, April 2026 - governance raised the rsETH oracle
+    # to liquidate the attacker; "debt" ~0 and collateral worth millions. Not a
+    # contestable opportunity, and it inflated Arbitrum by ~$90M.
+    from dataclasses import replace
+    store = Store(":memory:")
+    store.insert_range(146, 100, 200)
+    normal = _make_valued(net_usd=Decimal("50"), tx_hash="0xn")
+    huge = replace(_make_valued(net_usd=Decimal("31000000"), tx_hash="0xhack"),
+                   debt_usd=Decimal("0"), collateral_usd=Decimal("31000000"))
+    over_bonus = replace(_make_valued(net_usd=Decimal("900"), tx_hash="0xob"),
+                         debt_usd=Decimal("100"), collateral_usd=Decimal("1000"))
+    rep = generate_report(
+        chain_ids=[146], from_blocks={146: 100}, to_blocks={146: 200}, store=store,
+        valued_events={146: [normal, huge, over_bonus]}, validation_results={146: ValidationResult(146)},
+        eurusd=Decimal("1"), days=90, end_ts=1700000000,
+    )
+    cr = rep.chains[0]
+    assert cr.net_usd == Decimal("50")
+    assert sorted(a["tx_hash"] for a in cr.anomalies) == ["0xhack", "0xob"]
+    assert "anomal" in rep.to_text().lower()

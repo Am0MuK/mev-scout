@@ -160,6 +160,7 @@ class ChainReport:
     months: list[MonthReport]
     buckets: dict[str, BucketReport]
     validation: ValidationResult
+    anomalies: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -199,6 +200,14 @@ class CensusReport:
             lines.append(f"Chain: {cr.chain_name} (ID: {cr.chain_id})")
             lines.append(f"  Blocks: {cr.from_block} to {cr.to_block} (Coverage: {'Gaps None (100%)' if cr.covered else 'GAPS DETECTED'})")
             lines.append(f"  Events: {cr.event_count} total ({cr.unpriced_count} unpriced) | Distinct liquidators: {cr.distinct_liquidators}")
+            if cr.anomalies:
+                total_anom = sum(Decimal(x["net_usd"]) for x in cr.anomalies)
+                lines.append(
+                    f"  Anomalous liquidations excluded (collateral > debt x {ANOMALY_COLLATERAL_TO_DEBT} or debt 0): "
+                    f"{len(cr.anomalies)} events, ${total_anom:,.2f} net"
+                )
+                for x in sorted(cr.anomalies, key=lambda x: Decimal(x["net_usd"]), reverse=True)[:5]:
+                    lines.append(f"    {x['tx_hash']} block {x['block']}: debt ${Decimal(x['debt_usd']):,.2f}, collateral ${Decimal(x['collateral_usd']):,.2f}")
             lines.append(f"  Totals: Gross ${cr.gross_usd:,.2f} | Gas ${cr.gas_usd:,.2f} | Net ${cr.net_usd:,.2f} ({cr.net_eur:,.2f} EUR)")
             lines.append(f"  Monthly Average Net: {cr.avg_monthly_eur:,.2f} EUR/mo")
             lines.append(f"  Concentration: Top-1 {cr.top1_share * 100:.1f}% | Top-3 {cr.top3_share * 100:.1f}% | HHI {cr.hhi:,.0f}")
@@ -341,6 +350,18 @@ def _build_bucket_reports(
     return reports
 
 
+# Aave V3 liquidation bonuses are at most ~15%. Collateral worth more than the debt
+# plus this margin, or a zero debt, is not a market liquidation (e.g. the April 2026
+# rsETH governance liquidation after the KelpDAO hack).
+ANOMALY_COLLATERAL_TO_DEBT = Decimal("1.2")
+
+
+def _is_anomalous(it: ValuedLiquidation) -> bool:
+    if it.unpriced or it.debt_usd is None or it.collateral_usd is None:
+        return False
+    return it.debt_usd <= 0 or it.collateral_usd > it.debt_usd * ANOMALY_COLLATERAL_TO_DEBT
+
+
 def generate_report(
     chain_ids: list[int],
     from_blocks: dict[int, int],
@@ -364,7 +385,13 @@ def generate_report(
         if gaps:
             raise CoverageError(f"Coverage gap(s) detected for chain {cid} across [{fb}, {tb}]: {gaps}")
 
-        items = valued_events.get(cid, [])
+        all_items = valued_events.get(cid, [])
+        anomalies = [
+            {"tx_hash": it.event.tx_hash, "block": it.event.block, "collateral": it.event.collateral,
+             "debt_usd": str(it.debt_usd), "collateral_usd": str(it.collateral_usd), "net_usd": str(it.net_usd)}
+            for it in all_items if _is_anomalous(it)
+        ]
+        items = [it for it in all_items if not _is_anomalous(it)]
         v_res = validation_results.get(cid, ValidationResult(chain_id=cid))
 
         # Overall numbers
@@ -445,6 +472,7 @@ def generate_report(
                 months=month_reports,
                 buckets=chain_buckets,
                 validation=v_res,
+                anomalies=anomalies,
             )
         )
 
