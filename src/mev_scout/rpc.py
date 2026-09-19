@@ -27,9 +27,20 @@ def _redact_url(url: str) -> str:
         return "***"
 
 
+# Node-side hiccups that succeed on retry (seen live: Alchemy "layer stale").
+# "missing trie node" is deliberately absent: it means no archive state, retrying won't help.
+_TRANSIENT_MARKERS = ("layer stale", "header not found", "try again", "temporarily", "timeout", "busy")
+
+
 def _is_rate_limit(error: dict) -> bool:
+    """Errors worth retrying with back-off: rate limits and transient node errors."""
     message = str(error.get("message", "")).lower()
-    return error.get("code") in (429, -32005) or "rate" in message or "limit" in message
+    return (
+        error.get("code") in (429, -32005)
+        or "rate" in message
+        or "limit" in message
+        or any(m in message for m in _TRANSIENT_MARKERS)
+    )
 
 
 def _is_revert(error: dict) -> bool:
