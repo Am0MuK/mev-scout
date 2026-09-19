@@ -232,3 +232,27 @@ def test_block_by_time_failure_raises_explorer_error():
     client = EtherscanClient(api_key="KEY", http=http, sleep=lambda s: None)
     with pytest.raises(ExplorerError, match="Invalid timestamp"):
         client.block_by_time(chain_id=146, timestamp=1700000000)
+
+
+def _client(pages):
+    calls = iter(pages)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": "1", "message": "OK", "result": next(calls)})
+
+    return EtherscanClient(api_key="KEY", http=httpx.Client(transport=httpx.MockTransport(handler)), sleep=lambda s: None)
+
+
+def test_rows_outside_requested_range_are_an_error():
+    rows = [{"blockNumber": hex(5), "transactionHash": "0xa", "logIndex": "0x0"}]
+    with pytest.raises(ExplorerError, match="outside"):
+        _client([rows]).get_logs(1, "0xpool", "0xtopic", 10, 20)
+
+
+def test_rows_not_in_ascending_block_order_are_an_error():
+    rows = [
+        {"blockNumber": hex(15), "transactionHash": "0xa", "logIndex": "0x0"},
+        {"blockNumber": hex(12), "transactionHash": "0xb", "logIndex": "0x0"},
+    ]
+    with pytest.raises(ExplorerError, match="order"):
+        _client([rows]).get_logs(1, "0xpool", "0xtopic", 10, 20)

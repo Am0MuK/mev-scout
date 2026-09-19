@@ -25,6 +25,18 @@ def _is_rate_limit(status: str, message: str, result: Any) -> bool:
     return "rate limit" in combined or "limit reached" in combined
 
 
+def _check_page(page: list[dict], from_block: int, to_block: int) -> None:
+    """Pagination below relies on rows in ascending block order inside the range."""
+    previous = from_block
+    for r in page:
+        block = int(str(r["blockNumber"]), 0)
+        if not from_block <= block <= to_block:
+            raise ExplorerError(f"log in block {block} is outside the requested range {from_block}-{to_block}")
+        if block < previous:
+            raise ExplorerError(f"logs not in ascending block order (block {block} after {previous})")
+        previous = block
+
+
 class EtherscanClient:
     def __init__(
         self,
@@ -142,6 +154,7 @@ class EtherscanClient:
             page = self._request(params)
             if not isinstance(page, list):
                 raise ExplorerError(f"Expected list of logs, got {type(page)}")
+            _check_page(page, start_block, to_block)
 
             if len(page) < PAGE_SIZE:
                 all_rows.extend(page)

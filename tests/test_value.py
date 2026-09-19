@@ -143,3 +143,15 @@ def test_rpc_error_raises():
 
     with pytest.raises(RpcError, match="network transport failure"):
         value_events([event], chain_id=146, rpc=rpc, store=store)
+
+
+@pytest.mark.parametrize("which", ["collateral", "debt", "native"])
+def test_zero_oracle_price_marks_event_unpriced_not_zero(which):
+    # An oracle that answers 0 has no price for that asset; valuing the event at
+    # $0 would silently erase it from the monthly net.
+    prices = {"collateral_price": 1100 * 10**8, "debt_price": 10**8, "native_price": 2 * 10**8}
+    prices[f"{which}_price"] = 0
+    store = Store(":memory:")
+    results = value_events([_make_event()], chain_id=146, rpc=_setup_mock_rpc(**prices), store=store)
+    assert results[0].unpriced is True
+    assert results[0].net_usd is None

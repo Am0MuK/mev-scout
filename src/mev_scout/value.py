@@ -116,6 +116,11 @@ def value_liquidation(
         )
         price_native = int(native_price_data, 16)
 
+        # A zero price means the oracle has no price for that asset. Valuing the
+        # event at $0 would silently drop it from the totals, so it is unpriced.
+        if 0 in (price_c, price_d, price_native):
+            raise ContractCallError(f"oracle {oracle} returned price 0 at block {b}")
+
     except ContractCallError:
         return ValuedLiquidation(event=event, unpriced=True)
 
