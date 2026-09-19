@@ -268,8 +268,7 @@ def quote_round_trip(
         raise RpcError(f"block {block} has no baseFeePerGas")
     base_fee_val = int(str(block_obj["baseFeePerGas"]), 0)
 
-    if base_fee_val <= 0:
-        base_fee_val = 100_000_000
+    # A base fee of 0 is a real value (not a missing one); no substitute.
 
     gas_wei = total_gas * base_fee_val
     gas_eth = Decimal(gas_wei) / Decimal(10**18)

@@ -1164,3 +1164,22 @@ def test_run_xchain_sample_and_resume(tmp_path):
 
 
 
+
+
+def test_verdict_counts_months_not_one_average():
+    # Review fix: the verdict received a single averaged month, so one crash could
+    # carry the whole window past the "300 EUR in two thirds of months" rule.
+    from decimal import Decimal as _D
+    from mev_scout.xchain import XChainOpportunity, generate_xchain_report
+    end = 1_700_000_000
+
+    def opp(ts, net):
+        return XChainOpportunity(moment=ts, chain_buy=8453, chain_sell=42161, block_buy=1, block_sell=1,
+                                 pool_buy="0xa", pool_sell="0xb", size_usd=_D("10000"), gross_usd=net,
+                                 gas_usd=_D("0"), rebalance_usd=_D("0"), net_usd=net, gap_pct=_D("0.01"),
+                                 is_opportunity=True, persisted_next_block=True)
+    # 2,000 USD in the most recent month, nothing in the month before.
+    rep = generate_xchain_report([opp(end - 86400, _D("2000"))], total_moments=100, days=60,
+                                 eurusd=_D("1"), from_ts=end - 60 * 86400, to_ts=end)
+    assert rep.overall_verdict == "FAIL"
+    assert "1 of 2 months" in rep.overall_verdict_reason

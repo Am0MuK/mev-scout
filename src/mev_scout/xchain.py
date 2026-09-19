@@ -1128,8 +1128,28 @@ def generate_xchain_report(
             pair_best_monthly_eur[pair_name] = rep.monthly_net_eur
 
     overall_monthly_eur = sum(pair_best_monthly_eur.values(), Decimal("0"))
+
+    # Real 30-day months ending at the window end: per month and chain pair, the best
+    # size's executable net, summed over pairs. One crash month must not carry the
+    # whole window (same rule as the liquidation census).
+    anchor = to_ts or max((o.moment for o in opportunities), default=0)
+    m_count = max(1, int(days // 30))
+    monthly_eur: list[Decimal] = []
+    for m_idx in range(m_count):
+        hi = anchor - m_idx * 30 * 86400
+        lo = hi - 30 * 86400
+        per_pair: dict[str, dict[Decimal, Decimal]] = {}
+        for o in opportunities:
+            if not (o.is_opportunity and o.persisted_next_block is True and lo < o.moment <= hi):
+                continue
+            pair_key = f"{o.chain_buy}-{o.chain_sell}"
+            sizes = per_pair.setdefault(pair_key, {})
+            sizes[o.size_usd] = sizes.get(o.size_usd, Decimal("0")) + o.net_usd
+        month_usd = sum((max(v.values()) for v in per_pair.values()), Decimal("0"))
+        monthly_eur.append(month_usd / eurusd if eurusd > 0 else Decimal("0"))
+
     verdict, reason = evaluate_verdict(
-        [overall_monthly_eur] if overall_monthly_eur > 0 else [],
+        monthly_eur,
         top1_share=Decimal("0"),
         threshold_eur=threshold_eur,
     )
