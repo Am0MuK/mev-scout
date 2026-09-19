@@ -5,6 +5,7 @@ import sqlite3
 from typing import Any
 
 from mev_scout.decode import Liquidation
+from mev_scout.dex import Pool
 
 
 class Store:
@@ -69,6 +70,19 @@ class Store:
                     token_address TEXT NOT NULL,
                     decimals INTEGER NOT NULL,
                     PRIMARY KEY (chain_id, token_address)
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pools (
+                    chain_id INTEGER NOT NULL,
+                    dex TEXT NOT NULL,
+                    address TEXT NOT NULL,
+                    token0 TEXT NOT NULL,
+                    token1 TEXT NOT NULL,
+                    fee INTEGER NOT NULL,
+                    PRIMARY KEY (chain_id, address)
                 )
                 """
             )
@@ -263,6 +277,70 @@ class Store:
                 """,
                 (chain_id, token_address.lower(), decimals),
             )
+
+    def insert_pools(self, pools: list[Pool]) -> None:
+        if not pools:
+            return
+        rows = [
+            (
+                p.chain_id,
+                p.dex,
+                p.address.lower(),
+                p.token0.lower(),
+                p.token1.lower(),
+                p.fee,
+            )
+            for p in pools
+        ]
+        with self.conn:
+            self.conn.executemany(
+                """
+                INSERT OR REPLACE INTO pools (
+                    chain_id, dex, address, token0, token1, fee
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+
+    def get_pools(self, chain_id: int, dex: str | None = None) -> list[Pool]:
+        query = "SELECT chain_id, dex, address, token0, token1, fee FROM pools WHERE chain_id = ?"
+        params: list[Any] = [chain_id]
+        if dex is not None:
+            query += " AND dex = ?"
+            params.append(dex)
+        query += " ORDER BY dex ASC, address ASC"
+        cur = self.conn.cursor()
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        return [
+            Pool(
+                chain_id=r[0],
+                dex=r[1],
+                address=r[2],
+                token0=r[3],
+                token1=r[4],
+                fee=r[5],
+            )
+            for r in rows
+        ]
+
+    def get_pool(self, chain_id: int, address: str) -> Pool | None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT chain_id, dex, address, token0, token1, fee FROM pools WHERE chain_id = ? AND address = ?",
+            (chain_id, address.lower()),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return Pool(
+            chain_id=row[0],
+            dex=row[1],
+            address=row[2],
+            token0=row[3],
+            token1=row[4],
+            fee=row[5],
+        )
 
     def close(self) -> None:
         self.conn.close()
