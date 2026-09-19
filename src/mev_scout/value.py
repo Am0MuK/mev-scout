@@ -4,7 +4,6 @@ from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
-from unittest.mock import MagicMock
 
 from mev_scout.chains import CHAINS, ConfigError
 from mev_scout.decode import Liquidation
@@ -88,9 +87,10 @@ def _prefetch_events(
     if not events:
         return
 
-    batch_fn = getattr(rpc, "batch_call", None)
-    if not callable(batch_fn) or (isinstance(rpc, MagicMock) and not hasattr(rpc, "_batch_call_mocked")):
-        # For mocks without explicit batching, route through rpc.call
+    # Batch only with a client whose class really implements it; anything else
+    # (e.g. a minimal test double) goes through rpc.call one call at a time.
+    batch_fn = getattr(rpc, "batch_call", None) if hasattr(type(rpc), "batch_call") else None
+    if not callable(batch_fn):
         def mock_batch(calls):
             results = []
             for c in calls:
