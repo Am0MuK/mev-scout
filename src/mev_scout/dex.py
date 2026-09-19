@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import Any
 
-from mev_scout.rpc import RpcClient
+from mev_scout.rpc import ContractCallError, RpcClient
 
 GET_POOL_SELECTOR = "0x1698ee82"
 FACTORY_SELECTOR = "0xc45a0155"
@@ -125,7 +125,7 @@ def _execute_batch_or_single(
     for to, data, block in calls:
         try:
             results.append(rpc.call(to, data, block))
-        except Exception as exc:
+        except ContractCallError as exc:
             results.append(exc)
     return results
 
@@ -156,8 +156,12 @@ def discover_pools(chain_id: int, rpc: RpcClient) -> list[Pool]:
     verification_calls: list[tuple[str, str, str | int]] = []
 
     for (dex_key, tok_a, tok_b, factory, fee), res in zip(candidates, get_pool_results):
-        if isinstance(res, Exception):
+        # A revert means "no such pool"; any other error (outage, rate limit) must not
+        # silently remove a venue from the analysis.
+        if isinstance(res, ContractCallError):
             continue
+        if isinstance(res, Exception):
+            raise res
         if not isinstance(res, str):
             continue
         clean_res = res.removeprefix("0x").removeprefix("0X")

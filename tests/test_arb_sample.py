@@ -303,3 +303,93 @@ def test_arb_sample_report_and_verdict():
     data = json.loads(json_str)
     assert data["chain_id"] == 42161
     assert "WETH/USDC" in data["pairs"]
+
+
+# --- no silent guesses (Claude review 2026-09-19) ---------------------------------
+from decimal import Decimal as _D
+import pytest as _pytest
+from mev_scout import arb_sample as _as
+from mev_scout.dex import ARBITRUM_TOKENS as _T, Pool as _Pool
+from mev_scout.rpc import ContractCallError as _CCE, RpcError as _RE
+
+
+def _stable_pool(addr):
+    return _Pool(42161, "uniswap_v3", addr, _T["WETH"].address, _T["USDC"].address, 500)
+
+
+def test_weth_price_is_median_of_stable_pools_not_the_first_shallow_one():
+    pools = [_stable_pool("0x" + "01" * 20), _stable_pool("0x" + "02" * 20), _stable_pool("0x" + "03" * 20)]
+    mids = {pools[0].address: _D("9.14"), pools[1].address: _D("2648"), pools[2].address: _D("2645")}
+    assert _as._weth_usd_from_mids(pools, mids) == _D("2645")
+
+
+def test_no_stable_pool_price_gives_none_not_2600():
+    assert _as._weth_usd_from_mids([_stable_pool("0x" + "01" * 20)], {}) is None
+
+
+class _Rpc:
+    def __init__(self, exc):
+        self.exc = exc
+
+    def call(self, to, data, block):
+        raise self.exc
+
+
+def test_slot0_revert_is_counted():
+    mids, reverted = _as._read_slot0_mids([_stable_pool("0x" + "01" * 20)], 1, _Rpc(_CCE("reverted")))
+    assert mids == {} and reverted == 1
+
+
+def test_slot0_transport_error_is_not_counted_as_revert():
+    with _pytest.raises(_RE):
+        _as._read_slot0_mids([_stable_pool("0x" + "01" * 20)], 1, _Rpc(_RE("HTTP 503")))
+
+
+def test_sample_meta_keeps_unpriced_blocks():
+    from mev_scout.store import Store
+    st = Store(":memory:")
+    st.set_arb_sample_meta(_as.ArbSampleMeta(42161, 10, 2, 1, 100, 200, unpriced_blocks=3))
+    assert st.get_arb_sample_meta(42161).unpriced_blocks == 3
+
+
+class _RpcSeq:
+    """call() raises the given exception; _call() for blocks returns `block_obj`."""
+    def __init__(self, exc=None, block_obj=None):
+        self.exc, self.block_obj = exc, block_obj
+
+    def call(self, to, data, block):
+        if self.exc:
+            raise self.exc
+        # amountOut, sqrtPriceX96After, ticksCrossed, gasEstimate
+        return "0x" + hex(10**18)[2:].rjust(64, "0") + "0" * 64 * 2 + hex(100_000)[2:].rjust(64, "0")
+
+    def _call(self, method, params):
+        return self.block_obj
+
+
+def _two_pools():
+    a = _Pool(42161, "uniswap_v3", "0x" + "0a" * 20, _T["WETH"].address, _T["USDC"].address, 500)
+    b = _Pool(42161, "sushiswap_v3", "0x" + "0b" * 20, _T["WETH"].address, _T["USDC"].address, 500)
+    return a, b
+
+
+def test_quote_transport_error_propagates():
+    a, b = _two_pools()
+    with _pytest.raises(_RE):
+        _as.quote_round_trip(a, b, _T["USDC"].address, _T["WETH"].address, 1000, 10**9, 1, _RpcSeq(_RE("HTTP 503")), _D("2600"))
+
+
+def test_missing_base_fee_is_an_error_not_a_guess():
+    a, b = _two_pools()
+    with _pytest.raises(_RE):
+        _as.quote_round_trip(a, b, _T["USDC"].address, _T["WETH"].address, 1000, 10**9, 1, _RpcSeq(block_obj={}), _D("2600"))
+
+
+def test_pool_discovery_transport_error_is_not_a_missing_pool():
+    from mev_scout.dex import discover_pools
+
+    class R:
+        def call(self, to, data, block):
+            raise _RE("HTTP 503")
+    with _pytest.raises(_RE):
+        discover_pools(42161, R())

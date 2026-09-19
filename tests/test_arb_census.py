@@ -300,3 +300,64 @@ def test_arb_census_report_generation():
     data = json.loads(json_str)
     assert data["chain_id"] == 42161
     assert data["total_arbitrages"] == 2
+
+
+# --- no silent guesses (Claude review 2026-09-19) ---------------------------------
+
+WETH = ARBITRUM_TOKENS["WETH"].address
+WBTC = ARBITRUM_TOKENS["WBTC"].address
+USDC = ARBITRUM_TOKENS["USDC"].address
+
+
+def _wbtc_weth_cycle(ts=1000):
+    p1 = Pool(42161, "uniswap_v3", "0x" + "a1" * 20, WBTC, WETH, 500)
+    p2 = Pool(42161, "sushiswap_v3", "0x" + "a2" * 20, WBTC, WETH, 500)
+    tx = "0x" + "ee" * 32
+    # WETH in on p1 (bot pays 1 WETH, gets WBTC), WBTC back into p2 for 1.01 WETH.
+    s1 = DecodedSwap(42161, "uniswap_v3", p1.address, 100, ts, tx, 1, "0xb", "0xb", -4_000_000, 10**18, 2**96, 1, 0)
+    s2 = DecodedSwap(42161, "sushiswap_v3", p2.address, 100, ts, tx, 2, "0xb", "0xb", 4_000_000, -(101 * 10**16), 2**96, 1, 0)
+    pools = {p1.address: p1, p2.address: p2}
+    return detect_arbitrages([s1, s2], pools=pools), pools
+
+
+def test_no_weth_price_available_marks_arbitrage_unpriced_not_2600():
+    arbs, pools = _wbtc_weth_cycle()
+    assert len(arbs) == 1
+    v = value_arbitrages(arbs, rpc=FakeRpcForCensus(), pools=pools, store=Store(":memory:"))[0]
+    assert v.unpriced is True
+    assert "WETH" in v.unpriced_reason
+
+
+def test_stale_stable_swap_is_not_used_as_price():
+    arbs, pools = _wbtc_weth_cycle(ts=10_000)
+    stable = Pool(42161, "uniswap_v3", "0x" + "a3" * 20, WETH, USDC, 500)
+    pools[stable.address] = stable
+    store = Store(":memory:")
+    # Last stable-pool swap is two hours before the arbitrage.
+    store.insert_swaps([DecodedSwap(42161, "uniswap_v3", stable.address, 90, 10_000 - 7200, "0x" + "cc" * 32, 0,
+                                    "0xu", "0xu", 10**18, -2600 * 10**6, 4061072399780078164115456, 1, 0)])
+    v = value_arbitrages(arbs, rpc=FakeRpcForCensus(), pools=pools, store=store)[0]
+    assert v.unpriced is True
+
+
+def test_receipt_without_gas_fields_marks_arbitrage_unpriced():
+    arbs, pools = _wbtc_weth_cycle()
+    stable = Pool(42161, "uniswap_v3", "0x" + "a3" * 20, WETH, USDC, 500)
+    pools[stable.address] = stable
+    store = Store(":memory:")
+    store.insert_swaps([DecodedSwap(42161, "uniswap_v3", stable.address, 99, 999, "0x" + "cd" * 32, 0,
+                                    "0xu", "0xu", 10**18, -2600 * 10**6, 4061072399780078164115456, 1, 0)])
+    rpc = FakeRpcForCensus({arbs[0].tx_hash: {"from": "0xa", "to": "0xb", "logs": []}})
+    v = value_arbitrages(arbs, rpc=rpc, pools=pools, store=store)[0]
+    assert v.unpriced is True
+    assert "gas" in v.unpriced_reason
+
+
+def test_report_totals_exclude_unpriced_and_count_them():
+    priced = DetectedArbitrage("0x1", 1, 100, [], {}, gross_usd=Decimal("10"), gas_usd=Decimal("1"),
+                               net_usd=Decimal("9"), bot_from="0xa")
+    unpriced = DetectedArbitrage("0x2", 2, 200, [], {}, bot_from="0xb", unpriced=True, unpriced_reason="no WETH price")
+    rep = generate_arb_census_report(42161, [priced, unpriced], eurusd=Decimal("1"), end_ts=1000)
+    assert rep.net_usd == Decimal("9")
+    assert rep.unpriced_count == 1
+    assert "unpriced" in rep.to_text().lower()

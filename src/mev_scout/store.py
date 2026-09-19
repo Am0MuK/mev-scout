@@ -148,6 +148,7 @@ class Store:
                     reverted_quotes INTEGER NOT NULL,
                     from_block INTEGER NOT NULL,
                     to_block INTEGER NOT NULL,
+                    unpriced_blocks INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (chain_id)
                 )
                 """
@@ -624,8 +625,8 @@ class Store:
                 """
                 INSERT OR REPLACE INTO arb_sample_meta (
                     chain_id, total_sampled_blocks, skipped_prefilter_pairs,
-                    reverted_quotes, from_block, to_block
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    reverted_quotes, from_block, to_block, unpriced_blocks
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     meta.chain_id,
@@ -634,6 +635,7 @@ class Store:
                     meta.reverted_quotes,
                     meta.from_block,
                     meta.to_block,
+                    getattr(meta, "unpriced_blocks", 0),
                 ),
             )
 
@@ -644,7 +646,7 @@ class Store:
         cur.execute(
             """
             SELECT chain_id, total_sampled_blocks, skipped_prefilter_pairs,
-                   reverted_quotes, from_block, to_block
+                   reverted_quotes, from_block, to_block, unpriced_blocks
             FROM arb_sample_meta WHERE chain_id = ?
             """,
             (chain_id,),
@@ -659,6 +661,7 @@ class Store:
             reverted_quotes=row[3],
             from_block=row[4],
             to_block=row[5],
+            unpriced_blocks=row[6],
         )
 
     def close(self) -> None:

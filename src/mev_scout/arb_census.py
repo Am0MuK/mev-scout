@@ -34,6 +34,12 @@ class DetectedArbitrage:
     net_usd: Decimal = Decimal("0")
     bot_from: str = ""
     contract_to: str = ""
+    unpriced: bool = False
+    unpriced_reason: str = ""
+
+
+# A stable-pool price older than this is not used for valuation.
+MAX_PRICE_AGE_S = 3600
 
 
 @dataclass
@@ -95,6 +101,7 @@ class ArbCensusReport:
     buckets: dict[str, ArbBucketReport]
     validation: ArbValidationResult
     arbitrages: list[DetectedArbitrage] = field(default_factory=list)
+    unpriced_count: int = 0
 
     def to_text(self) -> str:
         lines = [
@@ -111,6 +118,7 @@ class ArbCensusReport:
             "Overall Summary:",
             f"  Total detected arbitrages: {self.total_arbitrages}",
             f"  Distinct bot addresses: {self.distinct_bots}",
+            f"  Unpriced arbitrages (excluded from totals): {self.unpriced_count}",
             f"  Gross profit: ${self.gross_usd:,.2f}",
             f"  Gas cost:     ${self.gas_usd:,.2f}",
             f"  Net profit:   ${self.net_usd:,.2f} ({self.net_eur:,.2f} EUR)",
@@ -157,6 +165,7 @@ class ArbCensusReport:
             "to_block": self.to_block,
             "total_arbitrages": self.total_arbitrages,
             "distinct_bots": self.distinct_bots,
+            "unpriced_count": self.unpriced_count,
             "gross_usd": str(self.gross_usd),
             "gas_usd": str(self.gas_usd),
             "net_usd": str(self.net_usd),
@@ -274,7 +283,7 @@ def _get_token_decimals(token_addr: str) -> int:
     for tok in ARBITRUM_TOKENS.values():
         if tok.address.lower() == clean:
             return tok.decimals
-    return 18
+    raise ValueError(f"unknown token {token_addr}: decimals not configured")
 
 
 def _sqrt_price_to_price(sqrt_price_x96: int, dec0: int, dec1: int) -> Decimal:
@@ -286,51 +295,45 @@ def _sqrt_price_to_price(sqrt_price_x96: int, dec0: int, dec1: int) -> Decimal:
 
 def _find_weth_usd_price(
     block: int,
-    dex: str,
+    timestamp: int,
     pools: dict[str, Pool],
     store: Store,
     chain_id: int = 42161,
-) -> Decimal:
-    """Find the WETH price in USD using a WETH/USDC or WETH/USDT pool."""
+) -> Decimal | None:
+    """WETH price in USD from the most recent WETH/USDC or WETH/USDT swap at or before `block`.
+
+    Returns None when no such swap exists within MAX_PRICE_AGE_S before `timestamp`; the
+    caller marks the arbitrage unpriced. Never a default price.
+    """
     weth = ARBITRUM_TOKENS["WETH"].address.lower()
-    usdc = ARBITRUM_TOKENS["USDC"].address.lower()
-    usdt = ARBITRUM_TOKENS["USDT"].address.lower()
+    stables = {ARBITRUM_TOKENS["USDC"].address.lower(), ARBITRUM_TOKENS["USDT"].address.lower()}
+    best = None
+    for pool in pools.values():
+        t0, t1 = pool.token0.lower(), pool.token1.lower()
+        if not ((t0 == weth and t1 in stables) or (t1 == weth and t0 in stables)):
+            continue
+        earlier = store.get_swaps(chain_id=chain_id, to_block=block, pool=pool.address)
+        if not earlier:
+            continue
+        last = max(earlier, key=lambda x: (x.block, x.log_index))
+        if timestamp - last.timestamp > MAX_PRICE_AGE_S:
+            continue
+        if best is None or (last.block, last.log_index) > (best[0].block, best[0].log_index):
+            best = (last, pool)
+    if best is None:
+        return None
+    last, pool = best
+    p0 = _sqrt_price_to_price(last.sqrt_price_x96, _get_token_decimals(pool.token0), _get_token_decimals(pool.token1))
+    if p0 <= 0:
+        return None
+    return p0 if pool.token0.lower() == weth else Decimal(1) / p0
 
-    # Find matching pools
-    stable_pools = [
-        p for p in pools.values()
-        if (p.token0.lower() == weth and p.token1.lower() in (usdc, usdt))
-        or (p.token1.lower() == weth and p.token0.lower() in (usdc, usdt))
-    ]
 
-    # Search for nearest earlier swap
-    for pool in stable_pools:
-        earlier_swaps = store.get_swaps(chain_id=chain_id, to_block=block, pool=pool.address)
-        if earlier_swaps:
-            last_swap = earlier_swaps[-1]
-            dec0 = _get_token_decimals(pool.token0)
-            dec1 = _get_token_decimals(pool.token1)
-            p0 = _sqrt_price_to_price(last_swap.sqrt_price_x96, dec0, dec1)
-            if pool.token0.lower() == weth:
-                return p0
-            else:
-                return Decimal(1) / p0 if p0 > 0 else Decimal("0")
-
-    # If no stored earlier swap found, check any swap from that pool
-    for pool in stable_pools:
-        any_swaps = store.get_swaps(chain_id=chain_id, pool=pool.address)
-        if any_swaps:
-            last_swap = any_swaps[0]
-            dec0 = _get_token_decimals(pool.token0)
-            dec1 = _get_token_decimals(pool.token1)
-            p0 = _sqrt_price_to_price(last_swap.sqrt_price_x96, dec0, dec1)
-            if pool.token0.lower() == weth:
-                return p0
-            else:
-                return Decimal(1) / p0 if p0 > 0 else Decimal("0")
-
-    # Fallback default price for Arbitrum tests if no pool swaps are loaded
-    return Decimal("2600")
+def _unpriced(arb: DetectedArbitrage, reason: str) -> DetectedArbitrage:
+    return DetectedArbitrage(
+        tx_hash=arb.tx_hash, block=arb.block, timestamp=arb.timestamp, swaps=arb.swaps,
+        net_token_flows=arb.net_token_flows, unpriced=True, unpriced_reason=reason,
+    )
 
 
 def value_arbitrages(
@@ -368,11 +371,15 @@ def value_arbitrages(
                 break
 
         if weth_price == Decimal("0"):
-            dex = arb.swaps[0].dex if arb.swaps else "uniswap_v3"
-            weth_price = _find_weth_usd_price(arb.block, dex, pools, store, chain_id)
+            found = _find_weth_usd_price(arb.block, arb.timestamp, pools, store, chain_id)
+            if found is None:
+                valued.append(_unpriced(arb, "no WETH/USD price within the last hour"))
+                continue
+            weth_price = found
 
         # Compute gross profit in USD
         gross_usd = Decimal("0")
+        unpriced_reason = ""
         for token, flow in arb.net_token_flows.items():
             if flow <= 0:
                 continue
@@ -407,13 +414,21 @@ def value_arbitrages(
                             price_found = True
                             break
                 if not price_found:
-                    # Default: cannot price without data
-                    pass
+                    unpriced_reason = f"no price for profit token {token}"
+                    break
+        if unpriced_reason:
+            valued.append(_unpriced(arb, unpriced_reason))
+            continue
 
         # Receipt gas and attribution
         receipt = rpc.receipt(arb.tx_hash)
-        gas_used = int(str(receipt.get("gasUsed", "0x0")), 0)
-        gas_price = int(str(receipt.get("effectiveGasPrice") or receipt.get("gasPrice") or "0x0"), 0)
+        raw_used = receipt.get("gasUsed")
+        raw_price = receipt.get("effectiveGasPrice") or receipt.get("gasPrice")
+        if raw_used is None or raw_price is None:
+            valued.append(_unpriced(arb, "receipt has no gas fields"))
+            continue
+        gas_used = int(str(raw_used), 0)
+        gas_price = int(str(raw_price), 0)
         gas_wei = gas_used * gas_price
         gas_eth = Decimal(gas_wei) / Decimal(10**18)
         gas_usd = gas_eth * weth_price
@@ -547,7 +562,13 @@ def generate_arb_census_report(
     end_ts: int | None = None,
     validation: ArbValidationResult | None = None,
 ) -> ArbCensusReport:
-    """Generate overall report, monthly breakdown, concentration, and verdict."""
+    """Generate overall report, monthly breakdown, concentration, and verdict.
+
+    Unpriced arbitrages are excluded from every total and counted separately.
+    """
+    all_arbitrages = arbitrages
+    arbitrages = [a for a in all_arbitrages if not a.unpriced]
+    unpriced_count = len(all_arbitrages) - len(arbitrages)
     now_ts = int(time.time()) if end_ts is None else end_ts
     from_block = min((a.block for a in arbitrages), default=0)
     to_block = max((a.block for a in arbitrages), default=0)
@@ -681,7 +702,8 @@ def generate_arb_census_report(
         months=months_report,
         buckets=buckets_report,
         validation=validation or ArbValidationResult(),
-        arbitrages=arbitrages,
+        arbitrages=all_arbitrages,
+        unpriced_count=unpriced_count,
     )
 
 

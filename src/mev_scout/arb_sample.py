@@ -20,7 +20,7 @@ from mev_scout.dex import (
 )
 from mev_scout.explorer import LogSource
 from mev_scout.report import evaluate_verdict
-from mev_scout.rpc import ContractCallError, RpcClient
+from mev_scout.rpc import ContractCallError, RpcClient, RpcError
 from mev_scout.store import Store
 
 SHALLOW_LIQUIDITY_THRESHOLD = 1_000_000_000
@@ -54,6 +54,7 @@ class ArbSampleMeta:
     reverted_quotes: int
     from_block: int
     to_block: int
+    unpriced_blocks: int = 0
 
 
 @dataclass
@@ -214,7 +215,7 @@ def quote_round_trip(
     try:
         res_1 = rpc.call(quoter_a, calldata_1, block)
         intermediate_amount, gas_1 = decode_quote_result(res_1)
-    except Exception:
+    except (ContractCallError, ValueError):
         return ArbSampleResult(
             block=int(str(block), 0) if str(block).isdigit() else 0,
             pair="",
@@ -234,7 +235,7 @@ def quote_round_trip(
     try:
         res_2 = rpc.call(quoter_b, calldata_2, block)
         final_amount, gas_2 = decode_quote_result(res_2)
-    except Exception:
+    except (ContractCallError, ValueError):
         return ArbSampleResult(
             block=int(str(block), 0) if str(block).isdigit() else 0,
             pair="",
@@ -260,11 +261,11 @@ def quote_round_trip(
 
     # Gas estimate
     total_gas = gas_1 + gas_2 + OVERHEAD_GAS
-    try:
-        block_obj = rpc._call("eth_getBlockByNumber", [hex(block) if isinstance(block, int) else block, False])
-        base_fee_val = int(str(block_obj.get("baseFeePerGas", "0x0")), 0) if isinstance(block_obj, dict) else 100_000_000
-    except Exception:
-        base_fee_val = 100_000_000
+    # No guessed base fee: a missing block or field is an error, not 0.1 gwei.
+    block_obj = rpc._call("eth_getBlockByNumber", [hex(block) if isinstance(block, int) else block, False])
+    if not isinstance(block_obj, dict) or block_obj.get("baseFeePerGas") is None:
+        raise RpcError(f"block {block} has no baseFeePerGas")
+    base_fee_val = int(str(block_obj["baseFeePerGas"]), 0)
 
     if base_fee_val <= 0:
         base_fee_val = 100_000_000
@@ -445,7 +446,54 @@ def _get_token_decimals(token_addr: str) -> int:
     for tok in ARBITRUM_TOKENS.values():
         if tok.address.lower() == clean:
             return tok.decimals
-    return 18
+    raise ValueError(f"unknown token {token_addr}: decimals not configured")
+
+
+def _read_slot0_mids(pools: list[Pool], block: int, rpc: RpcClient) -> tuple[dict[str, Decimal], int]:
+    """Mid price (token0 in token1) per pool at `block`.
+
+    A revert or empty result skips that pool and is counted; a transport error
+    (RpcError) propagates, because an outage is not information about the pool.
+    """
+    mids: dict[str, Decimal] = {}
+    reverted = 0
+    for p in pools:
+        try:
+            res = rpc.call(p.address, SLOT0_SELECTOR, block)
+        except ContractCallError:
+            reverted += 1
+            continue
+        clean = res.removeprefix("0x").removeprefix("0X")
+        sqrt_p = int(clean[0:64], 16)
+        ratio = Decimal(sqrt_p) / Decimal(2**96)
+        mids[p.address.lower()] = (ratio * ratio) * Decimal(
+            10 ** (_get_token_decimals(p.token0) - _get_token_decimals(p.token1))
+        )
+    return mids, reverted
+
+
+def _weth_usd_from_mids(pools: list[Pool], mids: dict[str, Decimal]) -> Decimal | None:
+    """Median WETH/USD over all WETH/USDC and WETH/USDT pools with a price.
+
+    The median ignores a shallow pool's absurd mid price (seen live: 9.14 vs ~2,648).
+    None when no stable pool has a price; never a default.
+    """
+    weth = ARBITRUM_TOKENS["WETH"].address.lower()
+    stables = {ARBITRUM_TOKENS["USDC"].address.lower(), ARBITRUM_TOKENS["USDT"].address.lower()}
+    prices = []
+    for p in pools:
+        t0, t1 = p.token0.lower(), p.token1.lower()
+        if not ((t0 == weth and t1 in stables) or (t1 == weth and t0 in stables)):
+            continue
+        m = mids.get(p.address.lower())
+        if m is None or m <= 0:
+            continue
+        prices.append(m if t0 == weth else Decimal(1) / m)
+    if not prices:
+        return None
+    prices.sort()
+    n = len(prices)
+    return prices[n // 2] if n % 2 else (prices[n // 2 - 1] + prices[n // 2]) / 2
 
 
 def run_arb_sampling(
@@ -497,31 +545,16 @@ def run_arb_sampling(
 
     skipped_prefilter_pairs = 0
     reverted_quotes = 0
+    unpriced_blocks = 0
     all_results: list[ArbSampleResult] = []
 
     for b in blocks:
-        slot0_map: dict[str, Decimal] = {}
-        for p in pools:
-            try:
-                res = rpc.call(p.address, SLOT0_SELECTOR, b)
-                clean = res.removeprefix("0x").removeprefix("0X")
-                sqrtP = int(clean[0:64], 16)
-                dec0 = _get_token_decimals(p.token0)
-                dec1 = _get_token_decimals(p.token1)
-                ratio = Decimal(sqrtP) / Decimal(2**96)
-                p_mid = (ratio * ratio) * Decimal(10 ** (dec0 - dec1))
-                slot0_map[p.address.lower()] = p_mid
-            except Exception:
-                reverted_quotes += 1
-
-        weth_price = Decimal("2600")
-        for p in pools:
-            if ((p.token0.lower() == weth and p.token1.lower() in (usdc, usdt))
-                or (p.token1.lower() == weth and p.token0.lower() in (usdc, usdt))):
-                p_mid = slot0_map.get(p.address.lower())
-                if p_mid is not None and p_mid > 0:
-                    weth_price = p_mid if p.token0.lower() == weth else (Decimal(1) / p_mid)
-                    break
+        slot0_map, reverted = _read_slot0_mids(pools, b, rpc)
+        reverted_quotes += reverted
+        weth_price = _weth_usd_from_mids(pools, slot0_map)
+        if weth_price is None:
+            unpriced_blocks += 1
+            continue
 
         for sym_a, sym_b in ARBITRUM_PAIRS:
             pair_key = f"{sym_a}/{sym_b}"
@@ -565,7 +598,7 @@ def run_arb_sampling(
                             liq_val = int(liq_res.removeprefix("0x").removeprefix("0X")[0:64], 16)
                             if liq_val < SHALLOW_LIQUIDITY_THRESHOLD:
                                 is_shallow = True
-                        except Exception:
+                        except ContractCallError:
                             reverted_quotes += 1
 
                     for sz in SIZES_USD:
@@ -617,6 +650,7 @@ def run_arb_sampling(
         reverted_quotes=reverted_quotes,
         from_block=from_block,
         to_block=to_block,
+        unpriced_blocks=unpriced_blocks,
     )
     store.insert_arb_samples(chain_id, all_results)
     store.set_arb_sample_meta(meta)
