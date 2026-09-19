@@ -196,3 +196,148 @@ def test_non_retryable_400_raises_immediately():
     with pytest.raises(RpcError, match="HTTP 400"):
         client.call("0xto", "0x00", 1)
     assert attempts == 1
+
+
+def test_batch_id_matching():
+    # 3 calls; mock server responds out-of-order: id 3, id 1, id 2
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[
+                {"jsonrpc": "2.0", "id": 3, "result": "0x3333"},
+                {"jsonrpc": "2.0", "id": 1, "result": "0x1111"},
+                {"jsonrpc": "2.0", "id": 2, "result": "0x2222"},
+            ],
+        )
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    client = RpcClient("https://rpc.example.com/secret", http, sleep=lambda s: None)
+    calls = [
+        ("0xto1", "0xdata1", 100),
+        ("0xto2", "0xdata2", 200),
+        ("0xto3", "0xdata3", 300),
+    ]
+    results = client.batch_call(calls)
+    assert len(results) == 3
+    assert results[0] == "0x1111"
+    assert results[1] == "0x2222"
+    assert results[2] == "0x3333"
+
+
+def test_batch_with_one_reverted_call():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[
+                {"jsonrpc": "2.0", "id": 1, "result": "0x1111"},
+                {"jsonrpc": "2.0", "id": 2, "error": {"code": 3, "message": "execution reverted: custom error"}},
+            ],
+        )
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    client = RpcClient("https://rpc.example.com/secret", http, sleep=lambda s: None)
+    calls = [
+        ("0xto1", "0xdata1", 100),
+        ("0xto2", "0xdata2", 200),
+    ]
+    results = client.batch_call(calls)
+    assert len(results) == 2
+    assert results[0] == "0x1111"
+    assert isinstance(results[1], ContractCallError)
+    assert "execution reverted" in str(results[1])
+
+
+def test_batch_with_missing_id():
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Server omitted response for id 2
+        return httpx.Response(
+            200,
+            json=[
+                {"jsonrpc": "2.0", "id": 1, "result": "0x1111"},
+            ],
+        )
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    client = RpcClient("https://rpc.example.com/secret", http, sleep=lambda s: None)
+    calls = [
+        ("0xto1", "0xdata1", 100),
+        ("0xto2", "0xdata2", 200),
+    ]
+    results = client.batch_call(calls)
+    assert len(results) == 2
+    assert results[0] == "0x1111"
+    assert isinstance(results[1], RpcError)
+    assert "Missing id 2" in str(results[1])
+
+
+def test_batch_with_duplicate_id():
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Server returned duplicate responses for id 1
+        return httpx.Response(
+            200,
+            json=[
+                {"jsonrpc": "2.0", "id": 1, "result": "0x1111a"},
+                {"jsonrpc": "2.0", "id": 1, "result": "0x1111b"},
+                {"jsonrpc": "2.0", "id": 2, "result": "0x2222"},
+            ],
+        )
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    client = RpcClient("https://rpc.example.com/secret", http, sleep=lambda s: None)
+    calls = [
+        ("0xto1", "0xdata1", 100),
+        ("0xto2", "0xdata2", 200),
+    ]
+    results = client.batch_call(calls)
+    assert len(results) == 2
+    assert isinstance(results[0], RpcError)
+    assert "Duplicate id 1" in str(results[0])
+    assert results[1] == "0x2222"
+
+
+def test_batch_exceeding_100_calls_chunks():
+    import json
+    chunks_received = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.read())
+        chunks_received.append(body)
+        return httpx.Response(
+            200,
+            json=[
+                {"jsonrpc": "2.0", "id": item["id"], "result": f"0xres_{item['id']}"}
+                for item in body
+            ],
+        )
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    client = RpcClient("https://rpc.example.com/secret", http, sleep=lambda s: None)
+
+    # 150 calls
+    calls = [("0xto", "0xdata", i) for i in range(150)]
+    results = client.batch_call(calls)
+
+    assert len(results) == 150
+    assert len(chunks_received) == 2
+    assert len(chunks_received[0]) == 100
+    assert len(chunks_received[1]) == 50
+
+
+def test_batch_transport_retry_succeeds():
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 2:
+            return httpx.Response(503, text="Service Unavailable")
+        return httpx.Response(
+            200,
+            json=[{"jsonrpc": "2.0", "id": 1, "result": "0xsuccess"}],
+        )
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    client = RpcClient("https://rpc.example.com/secret", http, sleep=lambda s: None)
+    results = client.batch_call([("0xto", "0xdata", 100)])
+    assert results == ["0xsuccess"]
+    assert attempts == 2
