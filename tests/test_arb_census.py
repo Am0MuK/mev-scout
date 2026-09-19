@@ -235,7 +235,7 @@ def test_validate_arbitrages_transfer_logs():
         tx_hash=tx,
         block=506700100,
         timestamp=1727000100,
-        swaps=[],
+        swaps=[DecodedSwap(42161, "uniswap_v3", pool_uni, 506700100, 1727000100, tx, 1, bot_contract, bot_contract, 0, 0, 2**96, 1, 0)],
         net_token_flows={usdc: 20_000_000},
         gross_usd=Decimal("20"),
         gas_usd=Decimal("2.63"),
@@ -361,3 +361,22 @@ def test_report_totals_exclude_unpriced_and_count_them():
     assert rep.net_usd == Decimal("9")
     assert rep.unpriced_count == 1
     assert "unpriced" in rep.to_text().lower()
+
+
+def test_validation_counts_flows_with_the_arbitrage_pools_not_what_the_bot_does_after():
+    # Real tx 0x28fbe96e...: the bot unwrapped its WETH profit (Transfer to 0x0) at the
+    # end, so its final WETH balance change was 0 although the arbitrage was real.
+    from mev_scout.arb_census import validate_arbitrages
+    TR = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+    bot, pa, pb = "0x" + "8a" * 20, "0x" + "c6" * 20, "0x" + "0d" * 20
+    weth, arb_tok = WETH.lower(), "0x" + "91" * 20
+
+    def tr(tok, frm, to, v):
+        return {"address": tok, "topics": [TR, "0x" + "0" * 24 + frm[2:], "0x" + "0" * 24 + to[2:]], "data": hex(v)}
+    logs = [tr(arb_tok, pb, bot, 340), tr(weth, pa, bot, 22129), tr(arb_tok, bot, pa, 340),
+            tr(weth, bot, pb, 22038), tr(weth, bot, "0x" + "00" * 20, 91)]
+    s1 = DecodedSwap(42161, "uniswap_v3", pa, 1, 1, "0xt", 1, bot, bot, -22129, 340, 2**96, 1, 0)
+    s2 = DecodedSwap(42161, "pancakeswap_v3", pb, 1, 1, "0xt", 2, bot, bot, 22038, -340, 2**96, 1, 0)
+    arb = DetectedArbitrage("0xt", 1, 1, [s1, s2], {weth: 91, arb_tok: 0}, bot_from="0x" + "01" * 20, contract_to=bot)
+    res = validate_arbitrages([arb], rpc=FakeRpcForCensus({"0xt": {"logs": logs, "gasUsed": "0x1", "effectiveGasPrice": "0x1"}}))
+    assert res.checks_passed == 1, res.disagreements

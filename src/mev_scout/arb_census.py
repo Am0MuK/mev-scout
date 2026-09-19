@@ -474,8 +474,7 @@ def validate_arbitrages(
     for a in sampled:
         receipt = rpc.receipt(a.tx_hash)
         logs = receipt.get("logs", [])
-        bot_to = a.contract_to.lower()
-        bot_from = a.bot_from.lower()
+        arb_pools = {sw.pool.lower() for sw in a.swaps}
 
         # Recompute net token flow to/from bot
         transfer_flows: dict[str, int] = defaultdict(int)
@@ -494,9 +493,12 @@ def validate_arbitrages(
             except (ValueError, TypeError):
                 continue
 
-            if to_addr in (bot_to, bot_from):
+            # Only flows between the arbitrage's pools and anyone else: what the bot does
+            # with its profit afterwards (unwrap to ETH, sweep to another wallet) is not
+            # part of the arbitrage and made 15/20 real samples look like mismatches.
+            if from_addr in arb_pools and to_addr not in arb_pools:
                 transfer_flows[token_addr] += val
-            if from_addr in (bot_to, bot_from):
+            if to_addr in arb_pools and from_addr not in arb_pools:
                 transfer_flows[token_addr] -= val
 
         # Check positive-profit tokens
