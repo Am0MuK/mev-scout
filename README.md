@@ -197,9 +197,52 @@ mev-scout arb-report --chain 42161 --eurusd 1.1460 [--threshold-eur 300] [--days
 
 ---
 
-## 8. Limitations & Non-Goals
+## 8. Phase 2C: Cross-Chain Inventory Arbitrage (Arbitrum, Base, Optimism)
 
-- **Phase 1 Scope**: Strictly observational liquidation census for Aave V3.
-- **Phase 2 Scope**: Strictly observational DEX arbitrage census on Arbitrum One. No execution bot, no private keys, no mempool listener, no CEX-DEX arbitrage, no cross-chain.
-- **Chains**: Arbitrum One (Phase 2), Arbitrum One + Sonic (Phase 1).
-- **Oracle / RPC Errors**: Never treated as zero. All errors, reverts, and missing data are counted and reported.
+Phase 2C censuses cross-chain inventory arbitrage opportunities between Arbitrum One (`42161`), Base (`8453`), and Optimism (`10`) for the WETH/USDC pair.
+
+### Mechanism
+The trader holds inventory in both WETH and USDC on each chain. When an executable cross-chain price gap exists between two chains:
+1. Buy WETH with USDC on the cheaper chain.
+2. Simultaneously sell WETH for USDC on the dearer chain for the exact WETH received.
+3. Rebalancing is accounted for via parameterized per-trade costs.
+
+### Venues & Adapters
+
+| Chain | Chain ID | DEX Venues | Adapters & Selectors | Canonical Deep Pool |
+|---|---|---|---|---|
+| Arbitrum | 42161 | Uniswap V3, SushiSwap V3, PancakeSwap V3 | Uniswap V3 fee adapter (`0x1698ee82`, `0xc6a5026a`) | Uni V3 0.05% (`0xc6962004f452be9203591991d15f6b388e09e8d0`) |
+| Base | 8453 | Uniswap V3, Slipstream 1, Slipstream Gauge Caps, Slipstream MinUnstake, Aerodrome Classic | Slipstream tickSpacing adapter (`0x28af8d0b`, `0x9e7defe6`); Classic Aerodrome adapter (`0x79bc57d5`, `0xf140a35a`) | Uni V3 0.01% (`0xb4cb800922cc596700c50d4f3b64c12ea85fa8ce`) |
+| Optimism | 10 | Uniswap V3, Velodrome Slipstream, Aero CL | Uniswap V3 fee adapter; Slipstream tickSpacing adapter | Uni V3 0.30% (`0xc1738d90c0f3056157f44d8525b642674e2d2740`) |
+
+### Methodology & Execution Rules
+
+1. **Time Grid & Block Search**: Samples moments every 5 minutes over the window (default 30 days), plus every 1 minute inside `--dense FROM:TO` ranges. Binary search on `eth_getBlockByNumber` resolves the last block with timestamp $\le$ moment.
+2. **Skew Guard**: Moments where any chain's block is $> 5$ seconds older than the moment are dropped and recorded.
+3. **Mid-Price Prefilter**: Reads `slot0` of each chain's deepest canonical pool. A chain pair is skipped if relative mid-price gap $\le (fee_A + fee_B) / 10^6 + \text{min\_rebalance\_pct}$. Boundary condition is exact: equal gap is skipped.
+4. **Best Executable Quotes & Shallow Check**: Queries all discovered pools on the chain at $1,000, $10,000, and $50,000 USD sizes. Requires chosen pool to quote $10\times$ size at no worse than 2% below $1\times$ price; shallow pools are flagged and skipped.
+5. **Gas & L1 Fee Costs**: Execution gas = quoter `gasEstimate` + 100,000 overhead priced at the block's `baseFeePerGas`. On Base and Optimism, the L1 data fee is added via `GasPriceOracle(0x420000000000000000000000000000000000000F).getL1Fee(bytes)` with 400-byte calldata payload.
+6. **Rebalance Costs**: Charged per trade via `--rebalance-pct` (default 0.05%) $\times \text{size}$ plus `--rebalance-fixed-usd` (default $1.00).
+7. **Persistence & Executability**: Profitable gaps are re-checked at the next blocks on both chains (+2 s), at +1 minute, and at +5 minutes. Only gaps still profitable at the next blocks count as **executable**.
+8. **Capital & RoC**: Capital required = $4 \times \text{size}$ (held as both USDC and WETH on both chains in the pair). Return on capital and monthly net profit are reported per pair and size.
+9. **Resume & Durability**: Results are committed to SQLite after every sampled moment, resuming automatically on restart and logging progress every 10 moments.
+
+### Phase 2C CLI Commands
+
+```bash
+# 1. Sample cross-chain moments across Arbitrum, Base, and Optimism
+mev-scout xchain-sample [--days 30] [--every-min 5] [--dense FROM:TO ...] [--rebalance-pct 0.0005] [--rebalance-fixed-usd 1.00] [--db data/scout.db]
+
+# 2. Generate report and monthly capital verdict
+mev-scout xchain-report --eurusd 1.1460 [--threshold-eur 300] [--days 30] [--json] [--csv data/xchain_opps.csv] [--db data/scout.db]
+```
+
+---
+
+## 9. Limitations & Non-Goals
+
+- **Phase 1 Scope**: Strictly observational liquidation census for Aave V3 on Arbitrum One and Sonic.
+- **Phase 2 Scope**: Strictly observational atomic DEX arbitrage on Arbitrum One (2A/2B), and cross-chain inventory arbitrage across Arbitrum, Base, and Optimism (2C).
+- **No Active Execution**: No private keys, no trade execution, no bridge calls, no mempool listeners, no CEX data.
+- **Upper Bound Nature**: The report explicitly states that results represent an upper bound of potential earnings: live execution introduces latency, partial fills, gas bidding competition, and inter-leg price risk.
+- **RPC & Error Discipline**: Transport errors propagate; only `ContractCallError` reverts are skipped and counted; missing data is marked unpriced and counted.
