@@ -318,9 +318,8 @@ def test_batch_exceeding_100_calls_chunks():
     results = client.batch_call(calls)
 
     assert len(results) == 150
-    assert len(chunks_received) == 2
-    assert len(chunks_received[0]) == 100
-    assert len(chunks_received[1]) == 50
+    from mev_scout.rpc import BATCH_SIZE
+    assert [len(c) for c in chunks_received] == [BATCH_SIZE] * (150 // BATCH_SIZE) + ([150 % BATCH_SIZE] if 150 % BATCH_SIZE else [])
 
 
 def test_batch_transport_retry_succeeds():
@@ -341,3 +340,19 @@ def test_batch_transport_retry_succeeds():
     results = client.batch_call([("0xto", "0xdata", 100)])
     assert results == ["0xsuccess"]
     assert attempts == 2
+
+
+def test_backoff_is_exponential_and_long_enough_for_free_tier():
+    # Live: Alchemy free tier kept answering 429 through 7.5 s of linear back-off.
+    sleeps = []
+    http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(429)))
+    client = RpcClient("https://rpc.example.com/secret", http, sleep=sleeps.append)
+    with pytest.raises(RpcError):
+        client.call("0xto", "0x00", 1)
+    assert sleeps == sorted(sleeps) and sleeps[1] == 2 * sleeps[0]
+    assert sum(sleeps) >= 60
+
+
+def test_batch_size_is_small():
+    from mev_scout import rpc as rpc_mod
+    assert rpc_mod.BATCH_SIZE <= 25

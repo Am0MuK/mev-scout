@@ -5,8 +5,9 @@ from typing import Any
 from urllib.parse import urlsplit
 import httpx
 
-RETRIES = 5
-BACKOFF_S = 0.5
+RETRIES = 6
+BACKOFF_S = 1.0  # doubles each retry: 1+2+4+8+16+32 = 63 s before giving up
+BATCH_SIZE = 25  # Alchemy free tier rate-limits by compute units per second
 _RETRY_STATUS = {429, 500, 502, 503, 504}
 
 
@@ -54,7 +55,7 @@ class RpcClient:
 
         for attempt in range(RETRIES + 1):
             if attempt:
-                self._sleep(BACKOFF_S * attempt)
+                self._sleep(BACKOFF_S * 2 ** (attempt - 1))
 
             try:
                 resp = self.http.post(self.url, json=payload)
@@ -106,7 +107,7 @@ class RpcClient:
             return []
 
         all_results: list[Any] = []
-        batch_size = 100
+        batch_size = BATCH_SIZE
 
         for i in range(0, len(calls), batch_size):
             chunk = calls[i : i + batch_size]
@@ -133,7 +134,7 @@ class RpcClient:
 
         for attempt in range(RETRIES + 1):
             if attempt:
-                self._sleep(BACKOFF_S * attempt)
+                self._sleep(BACKOFF_S * 2 ** (attempt - 1))
 
             try:
                 resp = self.http.post(self.url, json=payload)
