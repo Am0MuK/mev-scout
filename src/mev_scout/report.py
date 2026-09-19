@@ -63,13 +63,23 @@ def calculate_concentration(items: list[ValuedLiquidation]) -> dict[str, Decimal
 
 
 def evaluate_verdict(
-    avg_monthly_eur: Decimal,
+    monthly_eur: list[Decimal],
     top1_share: Decimal,
     threshold_eur: Decimal = Decimal("300"),
 ) -> tuple[str, str]:
+    """PASS needs the threshold in at least two thirds of the months, not on average.
+
+    One crash month can carry a large average while every other month earns
+    nothing (Sonic, June 2026); a bot needs income it can count on.
+    """
     fails = []
-    if avg_monthly_eur < threshold_eur:
-        fails.append(f"average monthly net below threshold ({avg_monthly_eur:.2f} EUR < {threshold_eur:.2f} EUR)")
+    n = len(monthly_eur)
+    required = (2 * n + 2) // 3
+    ok = sum(1 for m in monthly_eur if m >= threshold_eur)
+    if n == 0 or ok < required:
+        fails.append(
+            f"threshold {threshold_eur:.0f} EUR reached in {ok} of {n} months (needs {required})"
+        )
     if top1_share > Decimal("0.50"):
         top1_pct = top1_share * Decimal("100")
         fails.append(f"top-1 liquidator share too concentrated ({top1_pct:.1f}% > 50.0%)")
@@ -77,6 +87,22 @@ def evaluate_verdict(
     if fails:
         return "FAIL", " and ".join(fails)
     return "PASS", ""
+
+
+def _monthly_net_eur(
+    items: list[ValuedLiquidation], anchor_ts: int, m_count: int, eurusd: Decimal
+) -> list[Decimal]:
+    """Net EUR per 30-day month, newest first, half-open (start, end] periods."""
+    out = []
+    for m_idx in range(m_count):
+        hi = anchor_ts - m_idx * 30 * 86400
+        lo = hi - 30 * 86400
+        net = sum(
+            (it.net_usd for it in items if it.net_usd is not None and lo < it.event.timestamp <= hi),
+            Decimal("0"),
+        )
+        out.append(net / eurusd)
+    return out
 
 
 @dataclass
@@ -276,6 +302,8 @@ def _build_bucket_reports(
     num_months: Decimal,
     eurusd: Decimal,
     threshold_eur: Decimal,
+    anchor_ts: int,
+    m_count: int,
 ) -> dict[str, BucketReport]:
     buckets_data: dict[str, list[ValuedLiquidation]] = {b: [] for b in BUCKET_ORDER}
     for it in items:
@@ -293,7 +321,8 @@ def _build_bucket_reports(
         avg_monthly_e = net_e / num_months
 
         conc = calculate_concentration(b_items)
-        verdict, reason = evaluate_verdict(avg_monthly_e, conc["top1_share"], threshold_eur)
+        monthly = _monthly_net_eur(b_items, anchor_ts, m_count, eurusd)
+        verdict, reason = evaluate_verdict(monthly, conc["top1_share"], threshold_eur)
 
         reports[b_name] = BucketReport(
             bucket=b_name,
@@ -349,16 +378,17 @@ def generate_report(
         net_e = net_u / eurusd
         avg_monthly_e = net_e / num_months
 
-        conc = calculate_concentration(items)
-        verdict, reason = evaluate_verdict(avg_monthly_e, conc["top1_share"], threshold_eur)
-
-        # Monthly breakdown
-        # Months are consecutive 30-day periods ending at window end
-        # Anchor at the window end; the last event's time would shift every month.
+        # Months are consecutive 30-day periods ending at the window end; anchoring
+        # at the last event's time would shift every month.
         max_ts = end_ts if end_ts is not None else max((it.event.timestamp for it in items), default=0)
-        # Group into M consecutive 30-day periods
-        month_reports: list[MonthReport] = []
         m_count = max(1, int(days // 30))
+
+        conc = calculate_concentration(items)
+        verdict, reason = evaluate_verdict(
+            _monthly_net_eur(items, max_ts, m_count, eurusd), conc["top1_share"], threshold_eur
+        )
+
+        month_reports: list[MonthReport] = []
         for m_idx in range(m_count):
             m_end = max_ts - (m_idx * 30 * 86400)
             m_start = max_ts - ((m_idx + 1) * 30 * 86400)
@@ -371,7 +401,7 @@ def generate_report(
             m_net_e = m_net_u / eurusd
 
             m_conc = calculate_concentration(m_items)
-            m_buckets = _build_bucket_reports(m_items, Decimal("1"), eurusd, threshold_eur)
+            m_buckets = _build_bucket_reports(m_items, Decimal("1"), eurusd, threshold_eur, m_end, 1)
 
             month_reports.append(
                 MonthReport(
@@ -390,7 +420,7 @@ def generate_report(
                 )
             )
 
-        chain_buckets = _build_bucket_reports(items, num_months, eurusd, threshold_eur)
+        chain_buckets = _build_bucket_reports(items, num_months, eurusd, threshold_eur, max_ts, m_count)
 
         chain_reports.append(
             ChainReport(

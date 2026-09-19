@@ -75,29 +75,38 @@ def test_concentration_hand_computed():
     assert conc["hhi"] == Decimal("4600")
 
 
-def test_evaluate_verdict_pass():
-    verdict, reason = evaluate_verdict(avg_monthly_eur=Decimal("350"), top1_share=Decimal("0.40"), threshold_eur=Decimal("300"))
-    assert verdict == "PASS"
-    assert reason == ""
+M = Decimal
 
 
-def test_evaluate_verdict_fail_profit():
-    verdict, reason = evaluate_verdict(avg_monthly_eur=Decimal("250"), top1_share=Decimal("0.40"), threshold_eur=Decimal("300"))
+def test_verdict_pass_needs_two_thirds_of_months():
+    # 2 of 3 months at or above 300 EUR: pass.
+    verdict, reason = evaluate_verdict(monthly_eur=[M("300"), M("10"), M("400")], top1_share=M("0.40"))
+    assert verdict == "PASS", reason
+
+
+def test_verdict_one_crash_month_fails_even_with_huge_average():
+    # Sonic June 2026: one crash month carried the average; the other months were ~0.
+    verdict, reason = evaluate_verdict(monthly_eur=[M("20000"), M("40"), M("90")], top1_share=M("0.35"))
     assert verdict == "FAIL"
-    assert "below threshold" in reason
+    assert "1 of 3 months" in reason
 
 
-def test_evaluate_verdict_fail_concentration():
-    verdict, reason = evaluate_verdict(avg_monthly_eur=Decimal("350"), top1_share=Decimal("0.60"), threshold_eur=Decimal("300"))
+def test_verdict_twelve_months_needs_eight():
+    seven = [M("500")] * 7 + [M("0")] * 5
+    eight = [M("500")] * 8 + [M("0")] * 4
+    assert evaluate_verdict(monthly_eur=seven, top1_share=M("0.2"))[0] == "FAIL"
+    assert evaluate_verdict(monthly_eur=eight, top1_share=M("0.2"))[0] == "PASS"
+
+
+def test_verdict_fail_concentration():
+    verdict, reason = evaluate_verdict(monthly_eur=[M("400")] * 3, top1_share=M("0.60"))
     assert verdict == "FAIL"
     assert "too concentrated" in reason
 
 
-def test_evaluate_verdict_fail_both():
-    verdict, reason = evaluate_verdict(avg_monthly_eur=Decimal("250"), top1_share=Decimal("0.60"), threshold_eur=Decimal("300"))
-    assert verdict == "FAIL"
-    assert "below threshold" in reason
-    assert "too concentrated" in reason
+def test_verdict_fail_both():
+    verdict, reason = evaluate_verdict(monthly_eur=[M("0")] * 3, top1_share=M("0.60"))
+    assert "months" in reason and "too concentrated" in reason
 
 
 def test_report_coverage_gap_raises_coverage_error():

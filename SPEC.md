@@ -100,7 +100,10 @@ distinct `liquidator` addresses, and per 30-day month:
 
 Verdict per chain and per bucket:
 
-- **PASS** if average monthly `net` ≥ `--threshold-eur` (default 300) **and** top-1 share ≤ 50%;
+- **PASS** if monthly `net` ≥ `--threshold-eur` (default 300) in **at least two thirds of the
+  30-day months** of the window (2 of 3, 8 of 12) **and** top-1 share ≤ 50%;
+  (Changed 2026-09-19, owner-approved before the 12-month data was seen: the first 90-day run
+  passed Sonic $100–1k on its average although 529 of 533 events fell in one 3-day crash.)
 - otherwise **FAIL**, with the failing condition named.
 
 Top-1 share is a proxy for "the market is still contestable"; the report says so.
