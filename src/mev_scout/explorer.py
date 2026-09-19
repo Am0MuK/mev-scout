@@ -287,6 +287,9 @@ class BlockscoutClient(LogSource):
 
             if status == "1":
                 if full_params.get("action") == "getblocknobytime":
+                    # Blockscout wraps the number: {"blockNumber": "46807524"}.
+                    if isinstance(result, dict):
+                        result = result.get("blockNumber")
                     try:
                         return int(str(result), 0)
                     except (ValueError, TypeError) as exc:
@@ -295,7 +298,8 @@ class BlockscoutClient(LogSource):
                     return result
                 raise ExplorerError(f"status 1 but result is not a list: {self._clean(result)!r}"[:300])
 
-            if status == "0" and message == "No records found" and result == []:
+            # Blockscout says "No logs found" where Etherscan says "No records found".
+            if status == "0" and message in ("No records found", "No logs found") and result == []:
                 return []
 
             if _is_rate_limit(status, message, result):

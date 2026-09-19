@@ -192,3 +192,26 @@ def test_create_log_source_factory():
     avax_src = create_log_source(CHAINS[43114], http=http, api_key=None)
     assert isinstance(avax_src, BlockscoutClient)
     assert "routescan" in avax_src.base_url
+
+
+def _bs(payload):
+    http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json=payload)))
+    return BlockscoutClient(base_url="https://gnosis.blockscout.com/api", http=http, sleep=lambda s: None)
+
+
+def test_blockscout_block_by_time_real_shape():
+    # Captured live from gnosis.blockscout.com and base.blockscout.com on 2026-09-19.
+    payload = {"message": "OK", "result": {"blockNumber": "46807524"}, "status": "1"}
+    assert _bs(payload).block_by_time(100, 1_700_000_000) == 46807524
+
+
+def test_blockscout_empty_logs_real_shape():
+    # Blockscout says "No logs found" where Etherscan says "No records found".
+    payload = {"message": "No logs found", "result": [], "status": "0"}
+    assert _bs(payload).get_logs(100, "0xpool", "0xtopic", 1, 100) == []
+
+
+def test_blockscout_other_status_0_is_still_an_error():
+    payload = {"message": "Something else", "result": [], "status": "0"}
+    with pytest.raises(ExplorerError):
+        _bs(payload).get_logs(100, "0xpool", "0xtopic", 1, 100)
