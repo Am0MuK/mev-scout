@@ -376,3 +376,32 @@ def test_client_side_rate_limit_spaces_requests():
     client.batch_call([("0xto", "0x00", 1)] * 10)
     # 10 calls at 10/s = 1 s budget per batch: the second batch waits ~1 s.
     assert sum(sleeps) >= 0.99
+
+
+@pytest.mark.parametrize("msg", ["layer stale", "header not found", "please try again later"])
+def test_transient_node_errors_are_retried(msg):
+    # Live: Alchemy answered {'code': -32000, 'message': 'layer stale'} once and a
+    # 109-minute sampling run was lost because it was not retried.
+    n = {"i": 0}
+
+    def handler(request):
+        n["i"] += 1
+        if n["i"] == 1:
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": msg}})
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": "0x1"})
+
+    client = RpcClient("https://rpc.example.com/secret", httpx.Client(transport=httpx.MockTransport(handler)), sleep=lambda s: None)
+    assert client.call("0xto", "0x00", 1) == "0x1"
+
+
+def test_missing_trie_node_is_not_retried():
+    n = {"i": 0}
+
+    def handler(request):
+        n["i"] += 1
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "missing trie node abc"}})
+
+    client = RpcClient("https://rpc.example.com/secret", httpx.Client(transport=httpx.MockTransport(handler)), sleep=lambda s: None)
+    with pytest.raises(RpcError):
+        client.call("0xto", "0x00", 1)
+    assert n["i"] == 1
