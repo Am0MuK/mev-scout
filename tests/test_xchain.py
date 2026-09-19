@@ -379,3 +379,129 @@ def test_store_xchain_pools():
     assert by_addr[pool1.address.lower()].pool_key == 100
     assert pool2.address.lower() in by_addr
     assert by_addr[pool2.address.lower()].adapter_type == "slipstream"
+
+
+def test_generate_time_grid():
+    from mev_scout.xchain import generate_time_grid
+
+    # 15 minutes window: 0 to 900
+    # Regular 5-min step (300 s): 0, 300, 600, 900
+    # Dense range: 180:360 (every 60 s): 180, 240, 300, 360
+    grid = generate_time_grid(
+        start_ts=0,
+        end_ts=900,
+        step_s=300,
+        dense_ranges=["180:360"],
+        dense_step_s=60,
+    )
+    expected = [0, 180, 240, 300, 360, 600, 900]
+    assert grid == expected
+
+
+def test_find_block_by_timestamp_binary_search():
+    from mev_scout.xchain import find_block_by_timestamp
+
+    # 10 blocks: block N has timestamp 1000 + N * 2 (blocks every 2 s)
+    # block 1: 1002, block 2: 1004, ..., block 10: 1020
+    block_timestamps = {i: 1000 + i * 2 for i in range(1, 11)}
+    queried_blocks = []
+
+    class MockBlockRpc:
+        def block_number(self) -> int:
+            return 10
+
+        def _call(self, method: str, params: list):
+            if method == "eth_getBlockByNumber":
+                b_num = int(params[0], 16) if isinstance(params[0], str) and params[0].startswith("0x") else int(params[0])
+                queried_blocks.append(b_num)
+                if b_num in block_timestamps:
+                    return {"number": hex(b_num), "timestamp": hex(block_timestamps[b_num])}
+                return None
+            raise ValueError(f"Unexpected method: {method}")
+
+    rpc = MockBlockRpc()
+
+    # Query timestamp 1009 -> block 4 has ts 1008, block 5 has ts 1010 -> should return block 4
+    blk, ts = find_block_by_timestamp(chain_id=8453, target_ts=1009, rpc=rpc, low=1, high=10)
+    assert blk == 4
+    assert ts == 1008
+
+    # Query exact timestamp 1014 -> block 7 has ts 1014 -> should return block 7
+    blk, ts = find_block_by_timestamp(chain_id=8453, target_ts=1014, rpc=rpc, low=1, high=10)
+    assert blk == 7
+    assert ts == 1014
+
+    # Query target >= tip timestamp (e.g. 1025 >= 1020) -> returns tip (block 10)
+    blk, ts = find_block_by_timestamp(chain_id=8453, target_ts=1025, rpc=rpc, low=1, high=10)
+    assert blk == 10
+    assert ts == 1020
+
+
+def test_find_block_by_timestamp_caching():
+    from mev_scout.xchain import find_block_by_timestamp
+    from mev_scout.store import Store
+
+    store = Store(":memory:")
+    calls = []
+
+    class MockBlockRpc:
+        def block_number(self) -> int:
+            return 5
+
+        def _call(self, method: str, params: list):
+            b_num = int(params[0], 16) if isinstance(params[0], str) and params[0].startswith("0x") else int(params[0])
+            calls.append(b_num)
+            return {"number": hex(b_num), "timestamp": hex(1000 + b_num * 2)}
+
+    rpc = MockBlockRpc()
+    # First search
+    blk1, _ = find_block_by_timestamp(chain_id=10, target_ts=1005, rpc=rpc, store=store, low=1, high=5)
+    call_count_1 = len(calls)
+    assert call_count_1 > 0
+
+    # Second search with same target and store
+    blk2, _ = find_block_by_timestamp(chain_id=10, target_ts=1005, rpc=rpc, store=store, low=1, high=5)
+    assert blk1 == blk2
+    # Cached block timestamps mean fewer/no RPC calls for the same blocks
+    call_count_2 = len(calls)
+    assert call_count_2 == call_count_1
+
+
+def test_check_moment_skew_guard():
+    from mev_scout.xchain import check_moment_skew
+
+    moment = 1_000_000
+
+    # Case 1: Within 5 seconds on all chains -> passes
+    # Chain 42161: block at 999,998 (age 2 s)
+    # Chain 8453:  block at 999,997 (age 3 s)
+    # Chain 10:    block at 999,996 (age 4 s)
+    chain_blocks = {
+        42161: (100, 999_998),
+        8453: (200, 999_997),
+        10: (300, 999_996),
+    }
+    passes, skew = check_moment_skew(moment, chain_blocks)
+    assert passes is True
+    assert skew == 999_998 - 999_996  # 2 seconds skew
+
+    # Case 2: One chain's block is more than 5 s older (> 5 s) -> dropped
+    # Chain 10: block at 999,994 (age 6 s > 5 s)
+    chain_blocks_skewed = {
+        42161: (100, 999_998),
+        8453: (200, 999_997),
+        10: (300, 999_994),
+    }
+    passes, skew = check_moment_skew(moment, chain_blocks_skewed)
+    assert passes is False
+    assert skew == 999_998 - 999_994  # 4 seconds
+
+    # Case 3: Exactly 5 seconds -> passes (not more than 5 s older)
+    chain_blocks_boundary = {
+        42161: (100, 1_000_000),
+        8453: (200, 999_995),  # 1_000_000 - 999_995 = 5 s
+    }
+    passes, skew = check_moment_skew(moment, chain_blocks_boundary)
+    assert passes is True
+    assert skew == 5
+

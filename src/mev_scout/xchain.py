@@ -8,7 +8,7 @@ from decimal import Decimal
 from typing import Any
 
 from mev_scout.dex import TokenConfig
-from mev_scout.rpc import ContractCallError, RpcClient
+from mev_scout.rpc import ContractCallError, RpcClient, RpcError
 
 # Selectors
 UNISWAP_GET_POOL_SELECTOR = "0x1698ee82"
@@ -411,3 +411,104 @@ def discover_xchain_pools(
         )
 
     return pools
+
+
+def generate_time_grid(
+    start_ts: int,
+    end_ts: int,
+    step_s: int = 300,
+    dense_ranges: list[str] | None = None,
+    dense_step_s: int = 60,
+) -> list[int]:
+    """Generate time grid: every `step_s` (default 5 min = 300 s), plus every `dense_step_s` (60 s) in dense ranges."""
+    moments = set(range(start_ts, end_ts + 1, max(1, step_s)))
+    if dense_ranges:
+        for dr in dense_ranges:
+            if ":" in dr:
+                parts = dr.split(":")
+                df, dt = int(parts[0]), int(parts[1])
+                moments.update(range(df, dt + 1, max(1, dense_step_s)))
+    return sorted(moments)
+
+
+def find_block_by_timestamp(
+    chain_id: int,
+    target_ts: int,
+    rpc: Any,
+    store: Any = None,
+    low: int | None = None,
+    high: int | None = None,
+) -> tuple[int, int]:
+    """Find the last block with timestamp <= target_ts via binary search on eth_getBlockByNumber.
+
+    Returns (block_number, block_timestamp).
+    Uses caching (store and in-memory).
+    """
+    def _get_block_ts(b: int) -> int:
+        if store is not None:
+            cached = store.get_call_cache(chain_id, "block_timestamp", str(b), "0")
+            if cached is not None:
+                return int(cached)
+
+        block_hex = hex(b)
+        res = rpc._call("eth_getBlockByNumber", [block_hex, False])
+        if not isinstance(res, dict) or res.get("timestamp") is None:
+            raise RpcError(f"eth_getBlockByNumber failed or missing timestamp for block {b}")
+        ts = int(str(res["timestamp"]), 0)
+        if store is not None:
+            store.set_call_cache(chain_id, "block_timestamp", str(b), "0", str(ts))
+        return ts
+
+    if high is None:
+        high = rpc.block_number()
+    if low is None:
+        low = 1
+
+    high_ts = _get_block_ts(high)
+    if high_ts <= target_ts:
+        return high, high_ts
+
+    low_ts = _get_block_ts(low)
+    if low_ts > target_ts:
+        raise RpcError(f"No block with timestamp <= {target_ts} found (low block {low} has timestamp {low_ts})")
+
+    best_block = low
+    best_ts = low_ts
+    l = low
+    r = high
+
+    while l <= r:
+        mid = (l + r) // 2
+        mid_ts = _get_block_ts(mid)
+        if mid_ts <= target_ts:
+            best_block = mid
+            best_ts = mid_ts
+            l = mid + 1
+        else:
+            r = mid - 1
+
+    return best_block, best_ts
+
+
+def check_moment_skew(
+    moment: int,
+    chain_blocks: dict[int, tuple[int, int]],
+    max_age_s: int = 5,
+) -> tuple[bool, int]:
+    """Check skew guard: drop moment if any chain's block is more than 5 s older than moment.
+
+    Returns (passes, skew_s) where skew_s is max(timestamps) - min(timestamps).
+    """
+    timestamps = [ts for _, ts in chain_blocks.values()]
+    if not timestamps:
+        return False, 0
+
+    for _, ts in chain_blocks.values():
+        if ts > moment:
+            return False, 0
+        if (moment - ts) > max_age_s:
+            return False, max(timestamps) - min(timestamps)
+
+    skew = max(timestamps) - min(timestamps)
+    return True, skew
+
