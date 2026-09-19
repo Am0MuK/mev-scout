@@ -144,9 +144,62 @@ Any disagreement is displayed as a `WARNING` banner at the top of the report.
 
 ---
 
-## 7. Limitations & Non-Goals
+## 7. Phase 2: DEX Arbitrage Census (Arbitrum One)
 
-- **Phase 1 Scope**: Strictly observational census. No execution bot, no mempool listening, no smart contracts.
-- **Protocols**: Covers only Aave V3.
-- **Chains**: Arbitrum One and Sonic only (Base/Optimism blocked by free tier API limitations).
-- **Oracle Failures**: If an oracle call reverts on an exotic asset, the event is recorded as `unpriced` and excluded from profit totals (never treated as 0 profit).
+Phase 2 investigates DEX-to-DEX arbitrage on Arbitrum One (`chain_id 42161`) across Uniswap V3, SushiSwap V3, and PancakeSwap V3 across two complementary measurements:
+- **2A — What bots actually earned**: Reconstruct past atomic arbitrage transactions from historical `Swap` logs.
+- **2B — What was left on the table**: At sampled past blocks, check whether an executable round trip between pools was profitable after fees, price impact, and gas.
+
+### Supported DEX Venues & Tokens
+
+| DEX | Factory | QuoterV2 | Fee Tiers | Swap topic0 |
+|---|---|---|---|---|
+| Uniswap V3 | `0x1f98431c8ad98523631ae4a59f267346ea31f984` | `0x61ffe014ba17989e743c5f6cb21bf9697530b21e` | 100, 500, 3000, 10000 | `0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67` |
+| SushiSwap V3 | `0x1af415a1eba07a4986a52b6f2e7de7003d82231e` | `0x0524e833ccd057e4d7a296e3aaab9f7675964ce1` | 100, 500, 3000, 10000 | `0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67` |
+| PancakeSwap V3 | `0x0bfbcf9fa4f9c56b0f40a671ad40e0805a091865` | `0xb048bbc1ee6b733fffcfb9e9cef7375518e25997` | 100, 500, 2500, 10000 | `0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83` |
+
+*Note on PancakeSwap*: PancakeSwap's `Swap` event includes two extra protocol fee parameters (`protocolFeesToken0`, `protocolFeesToken1`), resulting in a distinct `topic0`. Filtering by the Uniswap topic would silently drop PancakeSwap swaps.
+
+**Tracked Tokens**: WETH, USDC, USDT, WBTC, ARB.
+**Tracked Pairs**: WETH/USDC, WETH/USDT, WBTC/WETH, ARB/WETH, ARB/USDC.
+
+### Phase 2 CLI Commands
+
+```bash
+# 1. Discover and record all active pools for tracked DEXes, pairs, and fee tiers
+mev-scout arb-pools --chain 42161 [--db data/scout.db]
+
+# 2. Fetch historical swap logs per pool with coverage tracking
+mev-scout arb-fetch --chain 42161 --days 90 [--db data/scout.db]
+
+# 3. 2A: Detect arbitrage cycles, value profit/gas, and output report & verdict
+mev-scout arb-census --chain 42161 --days 90 --eurusd 1.1460 [--threshold-eur 300] [--json] [--csv data/arbs.csv]
+
+# 4. 2B: Sample past blocks, prefilter mid-prices, execute round trips, and track persistence
+mev-scout arb-sample --chain 42161 --days 30 [--every-min 10] [--dense FROM:TO ...] [--db data/scout.db]
+
+# 5. 2B: Generate leftover opportunity report and upper bound monthly verdict
+mev-scout arb-report --chain 42161 --eurusd 1.1460 [--threshold-eur 300] [--days 30] [--json]
+```
+
+### 2A Valuation & Verification Discipline
+- **Atomic Cycle Condition**: Touches $\ge 2$ tracked pools; net flow across tracked swaps $\ge 0$ for all tokens and $> 0$ for at least one. Multi-hop plain swaps ending in another token are excluded.
+- **Valuation**: Priced at that block using `sqrtPriceX96` against stable pools (USDC/USDT = 1 USD). Gas computed from transaction receipt (`gasUsed * effectiveGasPrice`).
+- **Attribution & Concentration**: Attributed to transaction `from` (bot EOA) and `to` (contract). Monthly metrics include top-1 share, top-3 share, HHI, and size buckets (`<10`, `10–100`, `100–1k`, `≥1k`).
+- **Validation**: Fixed-seed deterministic sample of 20 detected arbitrages recomputes net token flows from receipt ERC-20 `Transfer` events.
+
+### 2B Prefilter & Quoting Rules
+- **Prefilter**: Mid-price gap between pool pairs must strictly exceed combined fees ($gap > fee_A + fee_B$). Pairs exactly at or below the fee boundary are skipped without querying the quoter.
+- **Round Trips**: Quoted on QuoterV2 at sizes of $1,000, $10,000, and $50,000 USD. Gas priced via base fee from `eth_getBlockByNumber` plus 100,000 overhead.
+- **Reverts**: Reverted quotes are skipped and counted; never treated as zero.
+- **Persistence**: Re-quotes at +1, +2, +5, and +20 blocks; stops at the first block without profit.
+- **Shallow Pools**: Opportunities on pools with liquidity below 1,000,000,000 are explicitly flagged.
+
+---
+
+## 8. Limitations & Non-Goals
+
+- **Phase 1 Scope**: Strictly observational liquidation census for Aave V3.
+- **Phase 2 Scope**: Strictly observational DEX arbitrage census on Arbitrum One. No execution bot, no private keys, no mempool listener, no CEX-DEX arbitrage, no cross-chain.
+- **Chains**: Arbitrum One (Phase 2), Arbitrum One + Sonic (Phase 1).
+- **Oracle / RPC Errors**: Never treated as zero. All errors, reverts, and missing data are counted and reported.
