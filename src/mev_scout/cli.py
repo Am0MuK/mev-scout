@@ -23,6 +23,7 @@ from mev_scout.arb_census import (
     value_arbitrages,
 )
 from mev_scout.arb_fetch import fetch_swaps
+from mev_scout.arb_sample import generate_arb_sample_report, run_arb_sampling
 from mev_scout.dex import discover_pools
 from mev_scout.fetch import fetch
 from mev_scout.report import CoverageError, generate_csv, generate_report
@@ -202,6 +203,77 @@ def arb_census_cmd(
         store.close()
 
 
+def arb_sample_cmd(
+    chain_id: int,
+    days: int = 30,
+    every_min: int = 10,
+    dense: list[str] | None = None,
+    db_path: str = "data/scout.db",
+) -> None:
+    if chain_id != 42161:
+        raise ConfigError(f"Arbitrage sampling currently only supports Arbitrum (42161), got {chain_id}")
+
+    chain = CHAINS[chain_id]
+    api_key = os.environ.get("ETHERSCAN_API_KEY")
+    if not api_key:
+        raise ConfigError("ETHERSCAN_API_KEY environment variable is required")
+
+    rpc_env = f"MEVSCOUT_RPC_{chain_id}"
+    rpc_url = os.environ.get(rpc_env)
+    if not rpc_url:
+        raise ConfigError(f"{rpc_env} environment variable is required")
+
+    store = Store(db_path)
+    try:
+        with httpx.Client(timeout=30.0) as http:
+            explorer = create_log_source(chain=chain, http=http, api_key=api_key)
+            rpc = RpcClient(url=rpc_url, http=http)
+            meta = run_arb_sampling(
+                chain_id=chain_id,
+                days=days,
+                every_min=every_min,
+                dense_ranges=dense,
+                rpc=rpc,
+                explorer=explorer,
+                store=store,
+            )
+            print(
+                f"Completed sampling {meta.total_sampled_blocks} blocks on chain {chain_id} "
+                f"({meta.skipped_prefilter_pairs} pairs skipped by prefilter, {meta.reverted_quotes} reverted quotes)"
+            )
+    finally:
+        store.close()
+
+
+def arb_report_cmd(
+    chain_id: int,
+    eurusd: Decimal,
+    threshold_eur: Decimal = Decimal("300"),
+    days: int = 30,
+    db_path: str = "data/scout.db",
+    as_json: bool = False,
+) -> str:
+    if chain_id != 42161:
+        raise ConfigError(f"Arbitrage report currently only supports Arbitrum (42161), got {chain_id}")
+
+    store = Store(db_path)
+    try:
+        meta = store.get_arb_sample_meta(chain_id)
+        if not meta:
+            raise CoverageError(f"no sampled arbitrage data for chain {chain_id}; run arb-sample first")
+        results = store.get_arb_samples(chain_id)
+        report = generate_arb_sample_report(
+            meta=meta,
+            results=results,
+            eurusd=eurusd,
+            threshold_eur=threshold_eur,
+            days=days,
+        )
+        return report.to_json() if as_json else report.to_text()
+    finally:
+        store.close()
+
+
 def report_cmd(
     chain_ids: list[int],
     eurusd: Decimal,
@@ -355,6 +427,23 @@ def main(argv=None) -> None:
     p_arb_census.add_argument("--json", action="store_true", help="Output JSON format")
     p_arb_census.add_argument("--csv", help="Optional path to output events CSV")
 
+    # arb-sample
+    p_arb_sample = subparsers.add_parser("arb-sample", help="Sample past blocks for leftover opportunities")
+    p_arb_sample.add_argument("--chain", type=int, required=True, help="Chain ID (42161)")
+    p_arb_sample.add_argument("--days", type=int, default=30, help="Window length in days (default: 30)")
+    p_arb_sample.add_argument("--every-min", type=int, default=10, help="Sampling interval in minutes (default: 10)")
+    p_arb_sample.add_argument("--dense", action="append", help="Dense block range FROM:TO (can repeat)")
+    p_arb_sample.add_argument("--db", default="data/scout.db", help="SQLite DB path (default: data/scout.db)")
+
+    # arb-report
+    p_arb_report = subparsers.add_parser("arb-report", help="Report leftover opportunities and upper bound verdict")
+    p_arb_report.add_argument("--chain", type=int, required=True, help="Chain ID (42161)")
+    p_arb_report.add_argument("--eurusd", type=Decimal, required=True, help="EUR/USD exchange rate")
+    p_arb_report.add_argument("--threshold-eur", type=Decimal, default=Decimal("300"), help="Monthly threshold in EUR (default: 300)")
+    p_arb_report.add_argument("--days", type=int, default=30, help="Window length in days (default: 30)")
+    p_arb_report.add_argument("--db", default="data/scout.db", help="SQLite DB path (default: data/scout.db)")
+    p_arb_report.add_argument("--json", action="store_true", help="Output JSON format")
+
     args = parser.parse_args(argv)
 
     try:
@@ -403,6 +492,28 @@ def main(argv=None) -> None:
                 db_path=args.db,
                 as_json=args.json,
                 csv_path=args.csv,
+            )
+            print(output)
+            sys.exit(0)
+
+        elif args.command == "arb-sample":
+            arb_sample_cmd(
+                chain_id=args.chain,
+                days=args.days,
+                every_min=args.every_min,
+                dense=args.dense,
+                db_path=args.db,
+            )
+            sys.exit(0)
+
+        elif args.command == "arb-report":
+            output = arb_report_cmd(
+                chain_id=args.chain,
+                eurusd=args.eurusd,
+                threshold_eur=args.threshold_eur,
+                days=args.days,
+                db_path=args.db,
+                as_json=args.json,
             )
             print(output)
             sys.exit(0)

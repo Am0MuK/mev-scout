@@ -120,6 +120,38 @@ class Store:
                 )
                 """
             )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS arb_samples (
+                    chain_id INTEGER NOT NULL,
+                    block INTEGER NOT NULL,
+                    pair TEXT NOT NULL,
+                    pool_a TEXT NOT NULL,
+                    pool_b TEXT NOT NULL,
+                    size_usd INTEGER NOT NULL,
+                    gross_usd TEXT,
+                    gas_usd TEXT,
+                    net_usd TEXT,
+                    is_opportunity INTEGER NOT NULL,
+                    persisted_blocks INTEGER NOT NULL DEFAULT 0,
+                    is_shallow INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (chain_id, block, pool_a, pool_b, size_usd)
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS arb_sample_meta (
+                    chain_id INTEGER NOT NULL,
+                    total_sampled_blocks INTEGER NOT NULL,
+                    skipped_prefilter_pairs INTEGER NOT NULL,
+                    reverted_quotes INTEGER NOT NULL,
+                    from_block INTEGER NOT NULL,
+                    to_block INTEGER NOT NULL,
+                    PRIMARY KEY (chain_id)
+                )
+                """
+            )
 
     def insert_liquidations(self, items: list[Liquidation]) -> None:
         if not items:
@@ -522,6 +554,112 @@ class Store:
             gaps.append((cursor, to_block))
 
         return gaps
+
+    def insert_arb_samples(self, chain_id: int, results: list[Any]) -> None:
+        if not results:
+            return
+        rows = [
+            (
+                chain_id,
+                r.block,
+                r.pair,
+                r.pool_a.lower(),
+                r.pool_b.lower(),
+                r.size_usd,
+                str(r.gross_usd) if r.gross_usd is not None else None,
+                str(r.gas_usd) if r.gas_usd is not None else None,
+                str(r.net_usd) if r.net_usd is not None else None,
+                1 if r.is_opportunity else 0,
+                r.persisted_blocks,
+                1 if r.is_shallow else 0,
+            )
+            for r in results
+        ]
+        with self.conn:
+            self.conn.executemany(
+                """
+                INSERT OR REPLACE INTO arb_samples (
+                    chain_id, block, pair, pool_a, pool_b, size_usd,
+                    gross_usd, gas_usd, net_usd, is_opportunity,
+                    persisted_blocks, is_shallow
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+
+    def get_arb_samples(self, chain_id: int) -> list[Any]:
+        from decimal import Decimal
+        from mev_scout.arb_sample import ArbSampleResult
+
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT block, pair, pool_a, pool_b, size_usd, gross_usd, gas_usd, net_usd,
+                   is_opportunity, persisted_blocks, is_shallow
+            FROM arb_samples WHERE chain_id = ? ORDER BY block ASC
+            """,
+            (chain_id,),
+        )
+        rows = cur.fetchall()
+        return [
+            ArbSampleResult(
+                block=r[0],
+                pair=r[1],
+                pool_a=r[2],
+                pool_b=r[3],
+                size_usd=r[4],
+                gross_usd=Decimal(r[5]) if r[5] is not None else None,
+                gas_usd=Decimal(r[6]) if r[6] is not None else None,
+                net_usd=Decimal(r[7]) if r[7] is not None else None,
+                is_opportunity=bool(r[8]),
+                persisted_blocks=r[9],
+                is_shallow=bool(r[10]),
+            )
+            for r in rows
+        ]
+
+    def set_arb_sample_meta(self, meta: Any) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO arb_sample_meta (
+                    chain_id, total_sampled_blocks, skipped_prefilter_pairs,
+                    reverted_quotes, from_block, to_block
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    meta.chain_id,
+                    meta.total_sampled_blocks,
+                    meta.skipped_prefilter_pairs,
+                    meta.reverted_quotes,
+                    meta.from_block,
+                    meta.to_block,
+                ),
+            )
+
+    def get_arb_sample_meta(self, chain_id: int) -> Any:
+        from mev_scout.arb_sample import ArbSampleMeta
+
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT chain_id, total_sampled_blocks, skipped_prefilter_pairs,
+                   reverted_quotes, from_block, to_block
+            FROM arb_sample_meta WHERE chain_id = ?
+            """,
+            (chain_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return ArbSampleMeta(
+            chain_id=row[0],
+            total_sampled_blocks=row[1],
+            skipped_prefilter_pairs=row[2],
+            reverted_quotes=row[3],
+            from_block=row[4],
+            to_block=row[5],
+        )
 
     def close(self) -> None:
         self.conn.close()
