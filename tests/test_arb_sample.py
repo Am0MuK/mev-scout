@@ -403,3 +403,22 @@ def test_sampled_block_bookkeeping_survives_restart():
     st.mark_sampled_block(42161, 200, skipped=2, reverted=0, unpriced=1)
     assert st.get_sampled_blocks(42161) == {100, 200}
     assert st.sampled_block_totals(42161) == (5, 1, 1)
+
+
+def test_shallow_pools_are_excluded_before_sampling():
+    # Live: a third of 3,204 quotes were on empty pools whose absurd mid prices
+    # always pass the prefilter; excluding them first saves most of the RPC budget.
+    deep = _Pool(42161, "uniswap_v3", "0x" + "0d" * 20, _T["WETH"].address, _T["USDC"].address, 500)
+    shallow = _Pool(42161, "sushiswap_v3", "0x" + "05" * 20, _T["WETH"].address, _T["USDC"].address, 100)
+    gone = _Pool(42161, "pancakeswap_v3", "0x" + "0e" * 20, _T["WETH"].address, _T["USDC"].address, 100)
+
+    class R:
+        def call(self, to, data, block):
+            if to == gone.address:
+                raise _CCE("reverted")
+            # 10**13 is far above the old absolute 1e9 threshold but under 1% of the deep pool.
+            liq = 10**18 if to == deep.address else 10**13
+            return "0x" + hex(liq)[2:].rjust(64, "0")
+    kept, excluded = _as._exclude_shallow_pools([deep, shallow, gone], R(), 100)
+    assert kept == [deep]
+    assert sorted(p.address for p in excluded) == sorted([shallow.address, gone.address])

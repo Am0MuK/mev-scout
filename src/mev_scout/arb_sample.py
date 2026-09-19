@@ -449,6 +449,44 @@ def _get_token_decimals(token_addr: str) -> int:
     raise ValueError(f"unknown token {token_addr}: decimals not configured")
 
 
+# A pool is kept only with at least this share of the deepest pool's liquidity for the
+# same token pair (liquidity units are not comparable across pairs, so no absolute cut).
+MIN_LIQUIDITY_SHARE_OF_DEEPEST = Decimal("0.01")
+
+
+def _exclude_shallow_pools(pools: list[Pool], rpc: RpcClient, block: int) -> tuple[list[Pool], list[Pool]]:
+    """Split pools into (kept, excluded) by in-range liquidity at `block`.
+
+    Empty pools quote absurd prices without an error (live: 1 WETH -> 9.14 USDC) and
+    their mid prices always pass the prefilter, so they are dropped once, up front,
+    and counted. A revert also excludes the pool; transport errors propagate.
+    """
+    liq: dict[str, int] = {}
+    excluded: list[Pool] = []
+    for p in pools:
+        try:
+            res = rpc.call(p.address, LIQUIDITY_SELECTOR, block)
+        except ContractCallError:
+            excluded.append(p)
+            continue
+        liq[p.address] = int(res.removeprefix("0x").removeprefix("0X")[0:64] or "0", 16)
+    deepest: dict[tuple[str, str], int] = {}
+    for p in pools:
+        if p.address in liq:
+            key = (p.token0.lower(), p.token1.lower())
+            deepest[key] = max(deepest.get(key, 0), liq[p.address])
+    kept: list[Pool] = []
+    for p in pools:
+        if p.address not in liq:
+            continue
+        top = deepest[(p.token0.lower(), p.token1.lower())]
+        if top > 0 and Decimal(liq[p.address]) >= Decimal(top) * MIN_LIQUIDITY_SHARE_OF_DEEPEST:
+            kept.append(p)
+        else:
+            excluded.append(p)
+    return kept, excluded
+
+
 def _read_slot0_mids(pools: list[Pool], block: int, rpc: RpcClient) -> tuple[dict[str, Decimal], int]:
     """Mid price (token0 in token1) per pool at `block`.
 
@@ -532,6 +570,9 @@ def run_arb_sampling(
     weth = ARBITRUM_TOKENS["WETH"].address.lower()
     usdc = ARBITRUM_TOKENS["USDC"].address.lower()
     usdt = ARBITRUM_TOKENS["USDT"].address.lower()
+
+    pools, shallow_excluded = _exclude_shallow_pools(pools, rpc, to_block)
+    print(f"arb-sample: {len(shallow_excluded)} shallow pools excluded, {len(pools)} kept", file=sys.stderr, flush=True)
 
     pools_by_pair: dict[str, list[Pool]] = defaultdict(list)
     for p in pools:
