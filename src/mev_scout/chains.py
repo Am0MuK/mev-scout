@@ -82,7 +82,7 @@ CHAINS: dict[int, ChainConfig] = {
         wrapped_native="0x4200000000000000000000000000000000000006",
         native_symbol="WETH",
         log_source="blockscout",
-        base_url="https://optimism.blockscout.com/api",
+        base_url="https://explorer.optimism.io/api",
     ),
     100: ChainConfig(
         chain_id=100,
@@ -91,7 +91,7 @@ CHAINS: dict[int, ChainConfig] = {
         wrapped_native="0xe91d153e0b41518a2ce8dd3d7944fa863463a97d",
         native_symbol="WXDAI",
         log_source="blockscout",
-        base_url="https://gnosis.blockscout.com/api",
+        base_url="https://gnosisscan.io/api",
     ),
     534352: ChainConfig(
         chain_id=534352,
@@ -100,7 +100,7 @@ CHAINS: dict[int, ChainConfig] = {
         wrapped_native="0x5300000000000000000000000000000000000004",
         native_symbol="WETH",
         log_source="blockscout",
-        base_url="https://scroll.blockscout.com/api",
+        base_url="https://scrollscan.com/api",
     ),
     42220: ChainConfig(
         chain_id=42220,

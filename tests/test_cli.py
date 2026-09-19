@@ -112,3 +112,13 @@ def test_cli_coverage_error_exits_2(monkeypatch, tmp_path, capsys):
         assert exc.value.code == 2
         _, err = capsys.readouterr()
         assert "Coverage gap" in err
+
+
+def test_value_without_fetched_data_fails_instead_of_valuing_zero(monkeypatch, tmp_path, capsys):
+    # A failed fetch left nothing in the store; "Valued 0 events" with exit 0
+    # would read as "no liquidations happened".
+    monkeypatch.setenv("MEVSCOUT_RPC_100", "https://rpc.example/key")
+    with pytest.raises(SystemExit) as exc:
+        main(["value", "--chain", "100", "--db", str(tmp_path / "s.db")])
+    assert exc.value.code == 2
+    assert "fetch" in capsys.readouterr().err.lower()

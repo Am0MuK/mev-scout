@@ -37,13 +37,13 @@ def test_chain_log_sources_and_urls():
     assert CHAINS[8453].base_url == "https://base.blockscout.com/api"
 
     assert CHAINS[10].log_source == "blockscout"
-    assert CHAINS[10].base_url == "https://optimism.blockscout.com/api"
+    assert CHAINS[10].base_url == "https://explorer.optimism.io/api"
 
     assert CHAINS[100].log_source == "blockscout"
-    assert CHAINS[100].base_url == "https://gnosis.blockscout.com/api"
+    assert CHAINS[100].base_url == "https://gnosisscan.io/api"
 
     assert CHAINS[534352].log_source == "blockscout"
-    assert CHAINS[534352].base_url == "https://scroll.blockscout.com/api"
+    assert CHAINS[534352].base_url == "https://scrollscan.com/api"
 
     assert CHAINS[42220].log_source == "blockscout"
     assert CHAINS[42220].base_url == "https://celo.blockscout.com/api"

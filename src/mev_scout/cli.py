@@ -47,7 +47,7 @@ def fetch_cmd(chain_id: int, days: int, db_path: str) -> None:
 
     store = Store(db_path)
     try:
-        with httpx.Client() as http:
+        with httpx.Client(timeout=30.0) as http:
             explorer = create_log_source(chain=chain, http=http, api_key=api_key)
             rpc = RpcClient(url=rpc_url, http=http)
             fetch(chain_id=chain_id, days=days, explorer=explorer, rpc=rpc, store=store)
@@ -71,8 +71,10 @@ def value_cmd(
 
     store = Store(db_path)
     try:
+        if store.last_fetched_block(chain_id) is None:
+            raise CoverageError(f"no fetched data for chain {chain_id}; run fetch first")
         events = store.get_liquidations(chain_id)
-        with httpx.Client() as http:
+        with httpx.Client(timeout=30.0) as http:
             rpc = RpcClient(url=rpc_url, http=http)
             valued = value_events(
                 events=events,
@@ -118,7 +120,7 @@ def report_cmd(
         now_ts = int(time.time())
         start_ts = now_ts - (days * 86400)
 
-        with httpx.Client() as http:
+        with httpx.Client(timeout=30.0) as http:
             for cid in chain_ids:
                 chain = CHAINS[cid]
                 explorer = create_log_source(chain=chain, http=http, api_key=api_key)

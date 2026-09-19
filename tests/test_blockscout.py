@@ -215,3 +215,24 @@ def test_blockscout_other_status_0_is_still_an_error():
     payload = {"message": "Something else", "result": [], "status": "0"}
     with pytest.raises(ExplorerError):
         _bs(payload).get_logs(100, "0xpool", "0xtopic", 1, 100)
+
+
+def test_blockscout_retries_timeouts():
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise httpx.ReadTimeout("slow", request=request)
+        return httpx.Response(200, json={"message": "No logs found", "result": [], "status": "0"})
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    client = BlockscoutClient(base_url="https://x/api", http=http, sleep=lambda s: None)
+    assert client.get_logs(100, "0xpool", "0xtopic", 1, 100) == []
+    assert calls["n"] == 3
+
+
+def test_chain_urls_do_not_redirect_to_another_host():
+    # gnosis/scroll/optimism.blockscout.com answer 301 to another host (verified 2026-09-19).
+    for cid in (10, 100, 534352):
+        assert "blockscout.com" not in CHAINS[cid].base_url
