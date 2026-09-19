@@ -49,6 +49,25 @@ discovery and "best executable quote" run over all of them, so liquidity that mi
 middle of the window is still seen. The report lists, per month, which factory the best quote
 came from, so the migration is visible instead of looking like a drop in liquidity.
 
+## Aero / Slipstream factories — verified 2026-09-19 (replaces the "find them" step)
+
+Base FactoryRegistry `0x5c3f18f06cc09ca1910767a34a20f771039e37c0` `poolFactories()` returned 4
+factories. Quoter per factory from `aerodrome-finance/slipstream` `script/constants/output/*.json`
+(repo commit f8717fa), each verified with `quoter.factory()`:
+
+| Chain | Factory | Quoter | Kind | WETH/USDC (10 WETH → USDC) |
+|---|---|---|---|---|
+| Base | `0x5e7bb104d84c7cb9b682aac2f3d509f5f406809a` | `0x254cf9e1e6e233aa1ac962cb9b05b2cfeaae15b0` | Slipstream 1 | ts100 → 26,448 |
+| Base | `0xade65c38cd4849adba595a4323a8c7ddfe89716a` | `0x3d4c22254f86f64b7ec90ab8f7aec1fbfd271c6c` | Slipstream Gauge Caps | ts50 (liquidity 4e14, small) |
+| Base | `0xf8f2eb4940cfe7d13603dddd87f123820fc061ef` | `0x514c8b5f54112481e28028f1166bd78501089259` | Slipstream MinUnstake (newest) | ts50 → 26,390; ts1 → 25,828 |
+| Base | `0x420dd381b31aef6683db6b902084cb0ffece40da` | — | classic v2-style pools (`getPool(a,b,bool stable)`, quote via `Pool.getAmountOut`) | include; probe first |
+| Optimism | `0xcc0bddb707055e04e497ab22a59c2af4391cd12f` | `0x89d8218ed5ff1e46d8dcd33fb0bbee3be1621466` | Velodrome Slipstream | ts100 → 26,382 |
+| Optimism | `0x548118c7e0b865c2cfa94d15ec86b666468ac758` | `0xa2decf05c16537c702779083fe067e308463ce45` | Aero CL on Optimism | ts100 pool exists but empty (→ 8.21): shallow, skipped by the rule below |
+
+All Slipstream quoters use `quoteExactInputSingle((address,address,uint256,int24,uint160))`
+`0x9e7defe6`. Liquidity is split across the old and new Base factories (26,448 vs 26,390 for
+10 WETH), so all of them must be queried.
+
 ## Live facts the code must respect
 
 - Shallow pools again return absurd quotes without an error: Optimism Uniswap 0.01%
