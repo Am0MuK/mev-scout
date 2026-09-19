@@ -15,6 +15,13 @@ from mev_scout.explorer import (
     create_log_source,
     redact,
 )
+from mev_scout.arb_census import (
+    detect_arbitrages,
+    generate_arb_census_report,
+    generate_arb_csv,
+    validate_arbitrages,
+    value_arbitrages,
+)
 from mev_scout.arb_fetch import fetch_swaps
 from mev_scout.dex import discover_pools
 from mev_scout.fetch import fetch
@@ -135,6 +142,62 @@ def arb_fetch_cmd(chain_id: int, days: int = 90, db_path: str = "data/scout.db")
             rpc = RpcClient(url=rpc_url, http=http)
             fetch_swaps(chain_id=chain_id, days=days, explorer=explorer, rpc=rpc, store=store)
             print(f"Fetched swaps for chain {chain_id} over {days} days")
+    finally:
+        store.close()
+
+
+def arb_census_cmd(
+    chain_id: int,
+    days: int,
+    eurusd: Decimal,
+    threshold_eur: Decimal = Decimal("300"),
+    db_path: str = "data/scout.db",
+    as_json: bool = False,
+    csv_path: str | None = None,
+) -> str:
+    if chain_id != 42161:
+        raise ConfigError(f"Arbitrage census currently only supports Arbitrum (42161), got {chain_id}")
+
+    rpc_env = f"MEVSCOUT_RPC_{chain_id}"
+    rpc_url = os.environ.get(rpc_env)
+    if not rpc_url:
+        raise ConfigError(f"{rpc_env} environment variable is required")
+
+    store = Store(db_path)
+    try:
+        pools_list = store.get_pools(chain_id)
+        if not pools_list:
+            raise CoverageError(f"no pools found for chain {chain_id}; run arb-pools first")
+        pools = {p.address.lower(): p for p in pools_list}
+
+        swaps = store.get_swaps(chain_id)
+        if not swaps:
+            raise CoverageError(f"no swaps found for chain {chain_id}; run arb-fetch first")
+
+        raw_arbs = detect_arbitrages(swaps, pools=pools)
+
+        with httpx.Client(timeout=30.0) as http:
+            rpc = RpcClient(url=rpc_url, http=http)
+            valued_arbs = value_arbitrages(raw_arbs, rpc=rpc, pools=pools, store=store, chain_id=chain_id)
+            val_res = validate_arbitrages(valued_arbs, rpc=rpc)
+
+        now_ts = int(time.time())
+        report = generate_arb_census_report(
+            chain_id=chain_id,
+            arbitrages=valued_arbs,
+            eurusd=eurusd,
+            threshold_eur=threshold_eur,
+            days=days,
+            end_ts=now_ts,
+            validation=val_res,
+        )
+
+        if csv_path:
+            csv_content = generate_arb_csv(valued_arbs, eurusd=eurusd)
+            with open(csv_path, "w", encoding="utf-8") as f:
+                f.write(csv_content)
+
+        return report.to_json() if as_json else report.to_text()
     finally:
         store.close()
 
@@ -282,6 +345,16 @@ def main(argv=None) -> None:
     p_arb_fetch.add_argument("--days", type=int, default=90, help="Days of history to fetch (default: 90)")
     p_arb_fetch.add_argument("--db", default="data/scout.db", help="SQLite DB path (default: data/scout.db)")
 
+    # arb-census
+    p_arb_census = subparsers.add_parser("arb-census", help="Analyze and report past atomic DEX arbitrage")
+    p_arb_census.add_argument("--chain", type=int, required=True, help="Chain ID (42161)")
+    p_arb_census.add_argument("--days", type=int, default=90, help="Days of history to analyze (default: 90)")
+    p_arb_census.add_argument("--eurusd", type=Decimal, required=True, help="EUR/USD exchange rate")
+    p_arb_census.add_argument("--threshold-eur", type=Decimal, default=Decimal("300"), help="Monthly threshold in EUR (default: 300)")
+    p_arb_census.add_argument("--db", default="data/scout.db", help="SQLite DB path (default: data/scout.db)")
+    p_arb_census.add_argument("--json", action="store_true", help="Output JSON format")
+    p_arb_census.add_argument("--csv", help="Optional path to output events CSV")
+
     args = parser.parse_args(argv)
 
     try:
@@ -319,6 +392,19 @@ def main(argv=None) -> None:
 
         elif args.command == "arb-fetch":
             arb_fetch_cmd(chain_id=args.chain, days=args.days, db_path=args.db)
+            sys.exit(0)
+
+        elif args.command == "arb-census":
+            output = arb_census_cmd(
+                chain_id=args.chain,
+                days=args.days,
+                eurusd=args.eurusd,
+                threshold_eur=args.threshold_eur,
+                db_path=args.db,
+                as_json=args.json,
+                csv_path=args.csv,
+            )
+            print(output)
             sys.exit(0)
 
     except Exception as exc:
