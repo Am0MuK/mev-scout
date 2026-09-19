@@ -153,7 +153,7 @@ class CensusReport:
         for cr in self.chains:
             v = cr.validation
             if v.has_warnings:
-                for dis in v.gas_disagreements + v.transfer_disagreements:
+                for dis in v.gas_disagreements + v.transfer_disagreements + v.l1_warnings:
                     warnings.append(f"WARNING [{cr.chain_name}]: {dis}")
         if warnings:
             lines.append("=" * 80)
@@ -179,7 +179,13 @@ class CensusReport:
             lines.append(f"  Overall Chain Verdict: [{cr.verdict}]" + (f" - {cr.verdict_reason}" if cr.verdict_reason else ""))
 
             # Validation tie-out
-            lines.append(f"  Sampled Tie-out (up to 20): Gas agree {cr.validation.gas_checks_passed}/{cr.validation.total_sampled} | Transfer agree {cr.validation.transfer_checks_passed}/{cr.validation.total_sampled}")
+            tie_out_line = (
+                f"  Sampled Tie-out (up to 20): Gas agree {cr.validation.gas_checks_passed}/{cr.validation.total_sampled} | "
+                f"Transfer agree {cr.validation.transfer_checks_passed}/{cr.validation.total_sampled}"
+            )
+            if cr.validation.l1_fee_share is not None:
+                tie_out_line += f" | Avg L1 fee share: {cr.validation.l1_fee_share * 100:.1f}%"
+            lines.append(tie_out_line)
 
             # Size Buckets
             lines.append("  Breakdown by Debt Size Bucket:")

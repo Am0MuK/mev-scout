@@ -181,3 +181,97 @@ def test_validation_sample_cap_at_20():
     res = validate_chain(events, chain_id=146, rpc=rpc)
     assert res.total_sampled == 20
     assert rpc.receipt.call_count == 20
+
+
+def test_validation_l1_fee_present_under_threshold():
+    from decimal import Decimal
+    event = _make_event(gas_used=100_000, gas_price=10**9)
+    # Execution fee = 100_000 * 10^9 = 10^14 wei
+    # L1 fee = 5 * 10^12 wei (5% of execution fee)
+    receipt = {
+        "transactionHash": event.tx_hash,
+        "gasUsed": hex(event.gas_used),
+        "effectiveGasPrice": hex(event.gas_price),
+        "l1Fee": hex(5 * 10**12),
+        "logs": [
+            {
+                "address": event.collateral,
+                "topics": [
+                    ERC20_TRANSFER_TOPIC0,
+                    "0x" + "0" * 24 + event.user[2:],
+                    "0x" + "0" * 24 + event.liquidator[2:],
+                ],
+                "data": hex(event.collateral_amount),
+            }
+        ],
+    }
+    rpc = MagicMock()
+    rpc.receipt.return_value = receipt
+    rpc.call.return_value = _make_reserve_data()
+
+    res = validate_chain([event], chain_id=8453, rpc=rpc)
+    assert res.l1_fee_share is not None
+    assert res.l1_fee_share == Decimal("0.05")
+    assert not res.has_warnings
+    assert len(res.l1_warnings) == 0
+
+
+def test_validation_l1_fee_present_over_threshold_triggers_warning():
+    from decimal import Decimal
+    event = _make_event(gas_used=100_000, gas_price=10**9)
+    # Execution fee = 100_000 * 10^9 = 10^14 wei
+    # L1 fee = 25 * 10^12 wei (25% of execution fee, > 10%)
+    receipt = {
+        "transactionHash": event.tx_hash,
+        "gasUsed": hex(event.gas_used),
+        "effectiveGasPrice": hex(event.gas_price),
+        "l1Fee": hex(25 * 10**12),
+        "logs": [
+            {
+                "address": event.collateral,
+                "topics": [
+                    ERC20_TRANSFER_TOPIC0,
+                    "0x" + "0" * 24 + event.user[2:],
+                    "0x" + "0" * 24 + event.liquidator[2:],
+                ],
+                "data": hex(event.collateral_amount),
+            }
+        ],
+    }
+    rpc = MagicMock()
+    rpc.receipt.return_value = receipt
+    rpc.call.return_value = _make_reserve_data()
+
+    res = validate_chain([event], chain_id=8453, rpc=rpc)
+    assert res.l1_fee_share == Decimal("0.25")
+    assert res.has_warnings
+    assert len(res.l1_warnings) == 1
+    assert "underestimated" in res.l1_warnings[0]
+
+
+def test_validation_l1_fee_absent_leaves_share_none():
+    event = _make_event()
+    receipt = {
+        "transactionHash": event.tx_hash,
+        "gasUsed": hex(event.gas_used),
+        "effectiveGasPrice": hex(event.gas_price),
+        "logs": [
+            {
+                "address": event.collateral,
+                "topics": [
+                    ERC20_TRANSFER_TOPIC0,
+                    "0x" + "0" * 24 + event.user[2:],
+                    "0x" + "0" * 24 + event.liquidator[2:],
+                ],
+                "data": hex(event.collateral_amount),
+            }
+        ],
+    }
+    rpc = MagicMock()
+    rpc.receipt.return_value = receipt
+    rpc.call.return_value = _make_reserve_data()
+
+    res = validate_chain([event], chain_id=146, rpc=rpc)
+    assert res.l1_fee_share is None
+    assert len(res.l1_warnings) == 0
+    assert not res.has_warnings

@@ -158,3 +158,39 @@ def test_report_text_and_json():
     assert 146 in [c["chain_id"] for c in data["chains"]]
     assert len(data["uncovered_chains"]) == 1
     assert "contestable" in data["market_note"]
+
+
+def test_report_with_l1_warning():
+    store = Store(":memory:")
+    store.insert_range(8453, 100, 200)
+
+    val_res = ValidationResult(
+        8453,
+        total_sampled=5,
+        gas_checks_passed=5,
+        transfer_checks_passed=5,
+        l1_fee_share=Decimal("0.185"),
+        l1_warnings=["average L1 fee is 18.5% of execution fee (>10%); gas is underestimated on this chain"],
+    )
+
+    report_data = generate_report(
+        chain_ids=[8453],
+        from_blocks={8453: 100},
+        to_blocks={8453: 200},
+        store=store,
+        valued_events={8453: []},
+        validation_results={8453: val_res},
+        eurusd=Decimal("1.20"),
+        threshold_eur=Decimal("300"),
+        days=90,
+    )
+
+    text = report_data.to_text()
+    assert "VALIDATION WARNINGS:" in text
+    assert "underestimated" in text
+    assert "18.5%" in text
+
+    json_str = report_data.to_json()
+    data = json.loads(json_str)
+    assert data["chains"][0]["validation"]["l1_fee_share"] == "0.185"
+    assert len(data["chains"][0]["validation"]["l1_warnings"]) == 1

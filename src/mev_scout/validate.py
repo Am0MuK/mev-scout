@@ -1,6 +1,7 @@
 """Validation module for sampled tie-out checks on receipts."""
 
 from dataclasses import dataclass, field
+from decimal import Decimal
 import random
 
 from mev_scout.chains import CHAINS, ConfigError
@@ -23,10 +24,16 @@ class ValidationResult:
     transfer_checks_not_run: int = 0
     not_run_reasons: list[str] = field(default_factory=list)
     transfer_disagreements: list[str] = field(default_factory=list)
+    l1_fee_share: Decimal | None = None
+    l1_warnings: list[str] = field(default_factory=list)
 
     @property
     def has_warnings(self) -> bool:
-        return (self.gas_checks_failed > 0) or (self.transfer_checks_failed > 0)
+        return (
+            (self.gas_checks_failed > 0)
+            or (self.transfer_checks_failed > 0)
+            or bool(self.l1_warnings)
+        )
 
 
 def validate_chain(
@@ -52,6 +59,9 @@ def validate_chain(
     sampled = rng.sample(sorted_events, sample_size)
     result.total_sampled = sample_size
 
+    l1_fees: list[int] = []
+    exec_fees_with_l1: list[int] = []
+
     for e in sampled:
         receipt = rpc.receipt(e.tx_hash)
 
@@ -70,6 +80,13 @@ def validate_chain(
             result.gas_disagreements.append(
                 f"tx {e.tx_hash}: receipt gasUsed*price ({rcpt_product}) != log gasUsed*price ({event_product})"
             )
+
+        # Check for rollup L1 fee
+        l1_fee_raw = receipt.get("l1Fee")
+        if l1_fee_raw is not None:
+            l1_fee = int(str(l1_fee_raw), 0)
+            l1_fees.append(l1_fee)
+            exec_fees_with_l1.append(rcpt_product)
 
         # 2. Collateral Transfer check (underlying or aToken)
         reserve_data_call = GET_RESERVE_DATA_SELECTOR + "0" * 24 + e.collateral.removeprefix("0x").lower()
@@ -116,6 +133,19 @@ def validate_chain(
             result.transfer_checks_failed += 1
             result.transfer_disagreements.append(
                 f"tx {e.tx_hash}: no Transfer of collateral or aToken to {e.liquidator} for amount {e.collateral_amount}"
+            )
+
+    if l1_fees:
+        total_l1 = sum(l1_fees)
+        total_exec = sum(exec_fees_with_l1)
+        if total_exec > 0:
+            result.l1_fee_share = Decimal(total_l1) / Decimal(total_exec)
+        else:
+            result.l1_fee_share = Decimal("0")
+
+        if result.l1_fee_share > Decimal("0.10"):
+            result.l1_warnings.append(
+                f"average L1 fee is {result.l1_fee_share * 100:.1f}% of execution fee (>10%); gas is underestimated on this chain"
             )
 
     return result
