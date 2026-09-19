@@ -122,7 +122,12 @@ def report_cmd(
                 rpc = RpcClient(url=rpc_url, http=http)
 
                 fb = explorer.block_by_time(cid, start_ts)
-                tb = rpc.block_number()
+                # The window ends at the last fetched block, not the live tip: on fast
+                # chains the tip moves between fetch and report, which is not a gap.
+                last = store.last_fetched_block(cid)
+                if last is None:
+                    raise CoverageError(f"no fetched data for chain {cid}; run fetch first")
+                tb = min(rpc.block_number(), last)
                 if fb > tb:
                     fb = tb
 
@@ -158,6 +163,7 @@ def report_cmd(
             valued_events=valued_events,
             validation_results=validation_results,
             eurusd=eurusd,
+            end_ts=now_ts,
             threshold_eur=threshold_eur,
             days=days,
         )

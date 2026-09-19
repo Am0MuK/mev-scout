@@ -316,6 +316,7 @@ def generate_report(
     eurusd: Decimal,
     threshold_eur: Decimal = Decimal("300"),
     days: int = 90,
+    end_ts: int | None = None,
 ) -> CensusReport:
     num_months = Decimal(days) / Decimal(30)
     chain_reports: list[ChainReport] = []
@@ -347,14 +348,16 @@ def generate_report(
 
         # Monthly breakdown
         # Months are consecutive 30-day periods ending at window end
-        max_ts = max((it.event.timestamp for it in items), default=0)
+        # Anchor at the window end; the last event's time would shift every month.
+        max_ts = end_ts if end_ts is not None else max((it.event.timestamp for it in items), default=0)
         # Group into M consecutive 30-day periods
         month_reports: list[MonthReport] = []
         m_count = max(1, int(days // 30))
         for m_idx in range(m_count):
             m_end = max_ts - (m_idx * 30 * 86400)
             m_start = max_ts - ((m_idx + 1) * 30 * 86400)
-            m_items = [it for it in items if m_start <= it.event.timestamp <= m_end]
+            # Half-open (start, end]: an event on a boundary belongs to exactly one month.
+            m_items = [it for it in items if m_start < it.event.timestamp <= m_end]
 
             m_gross = sum((it.gross_usd for it in m_items if it.gross_usd is not None), Decimal("0"))
             m_gas = sum((it.gas_usd for it in m_items if it.gas_usd is not None), Decimal("0"))
