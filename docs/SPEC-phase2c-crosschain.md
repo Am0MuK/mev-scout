@@ -39,6 +39,16 @@ Velodrome Slipstream (Optimism), probed 2026-09-19: factory
 reverts with `execution reverted: Unexpected error` (code 3) — a revert, skipped and counted.
 Include Velodrome.
 
+**Aero merger (owner note + public reports, 2026-09-19):** Velodrome and Aerodrome are merging
+into one cross-chain DEX, "Aero" (target ~July 2026), with liquidity providers asked since
+May 2026 to move to new pools, and expansion to Ethereum and Arc. Before implementation:
+find the new Aero pool factories/quoters on Base and Optimism from Aero's official docs or
+repositories (not from memory), verify each on-chain (`factory()`, a real WETH/USDC quote),
+and include **both** the old Slipstream factories and the new ones. At every moment, pool
+discovery and "best executable quote" run over all of them, so liquidity that migrated in the
+middle of the window is still seen. The report lists, per month, which factory the best quote
+came from, so the migration is visible instead of looking like a drop in liquidity.
+
 ## Live facts the code must respect
 
 - Shallow pools again return absurd quotes without an error: Optimism Uniswap 0.01%
