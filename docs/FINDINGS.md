@@ -72,7 +72,9 @@ Celo required a retry through a Blockscout 429.
 
 ### 1.3 Aave V4 (Ethereum and Arc)
 
-Measured with an ad-hoc script against the V4 `Spoke` ABI, **not** with the CLI in this repo.
+Measured against the V4 `Spoke` ABI with [`../scripts/v4_value.py`](../scripts/v4_value.py),
+a standalone script — **not** with the CLI, which covers V3 only. The script is published as
+it was run, so these numbers are reproducible; it has no test suite behind it.
 V4 `LiquidationCall` has `topic0`
 `0x2a1f12d996f530f89d8038aa293f9fde81cac44b6dfd6225e3358d09b78a4a37` (from
 `aave/aave-v4 src/spoke/interfaces/ISpoke.sol`, including the `PremiumDelta` tuple); pricing

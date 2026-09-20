@@ -54,8 +54,8 @@ Whole-market net profit (every bot combined), not what a newcomer would capture:
 - **Aave V4** (Ethereum, live since March 2026): 201 liquidations in five months, $98 k gross,
   36 liquidators, top-1 41%, median bonus 4.49% — the Dutch auction does not produce large
   bonuses in practice. On Arc (mainnet 16 September 2026): zero liquidations in the first
-  3.4 days. *Measured with an ad-hoc script against the V4 `Spoke` ABI, not with the CLI in
-  this repo — see [`docs/FINDINGS.md`](docs/FINDINGS.md).*
+  3.4 days. Measured against the V4 `Spoke` ABI with
+  [`scripts/v4_value.py`](scripts/v4_value.py) rather than the main CLI, which covers V3 only.
 
 ### 2.2 Same-chain DEX arbitrage (Arbitrum, 90 days) — dead
 
@@ -90,12 +90,9 @@ race for scraps outside a handful of crash days; cross-chain gaps are real but t
 too capital-hungry to clear 300 EUR in two thirds of months. The recommendation the data
 supports is to **not build the bot**.
 
-### A caveat that matters
-
-The CLI prints `PASS` for several of these markets. **That `PASS` only means the market is
-large enough and not monopolised — it is not a claim that a newcomer would capture any of
-it.** Capture depends on latency against incumbent bots, which this tool does not measure.
-Read every verdict in the report as a statement about the market, never about you.
+The CLI prints `PASS` for several of these markets. That verdict means the market is large
+enough and not monopolised — not that a newcomer would capture any of it. Capture depends on
+latency against incumbent bots, which this tool does not measure.
 
 ---
 
@@ -342,7 +339,7 @@ code, not because they are unique to this project.
 ## 11. Limitations & non-goals
 
 - **Observational only**: a liquidation census for Aave V3 across 12 chains, atomic DEX arbitrage on Arbitrum One (2A/2B), and cross-chain inventory arbitrage across Arbitrum, Base and Optimism (2C). Nothing here trades.
-- **Protocol coverage**: Aave V3 only. Aave V4 was measured separately with an ad-hoc script and is not supported by this CLI.
+- **Protocol coverage**: the CLI covers Aave V3 only. The V4 measurement is a standalone script, [`scripts/v4_value.py`](scripts/v4_value.py), not wired into the CLI or its test suite.
 - **Venue coverage**: Uniswap V3, SushiSwap V3 and PancakeSwap V3 (plus Aerodrome/Velodrome Slipstream venues on Base and Optimism for 2C). Camelot, Uniswap V4, Balancer and others are not tracked, so same-chain arbitrage figures are a lower bound.
 - **Market, not capture**: a `PASS` verdict means the market is large enough and not monopolised. It is not a measurement of what a newcomer would win — that depends on latency against incumbent bots, which this tool does not measure.
 - **No active execution**: no private keys, no trade execution, no bridge calls, no mempool listeners, no CEX data.
