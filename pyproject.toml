@@ -5,8 +5,18 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mev-scout"
 version = "0.1.0"
-description = "Liquidation opportunity census for Aave V3 on Arbitrum and Sonic"
+description = "Read-only census of MEV opportunities: Aave V3 liquidations, same-chain DEX arbitrage, and cross-chain inventory arbitrage"
 readme = "README.md"
+license = { file = "LICENSE" }
+keywords = ["mev", "defi", "ethereum", "arbitrage", "liquidations", "aave"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.25.0",

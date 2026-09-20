@@ -1,105 +1,175 @@
 # mev-scout
 
-Phase 1 liquidation opportunity census for Aave V3 on Arbitrum One and Sonic.
+A read-only measurement tool that answers three questions for any EVM chain:
+**is there MEV money here, who takes it, and how long does an opportunity survive?**
+
+It was built to settle one decision with data instead of opinion — *should a newcomer build
+a DeFi arbitrage or liquidation bot in 2026?* — and it answered that question with **no**.
+The tool, the method and the measurements are published here because the measurement is
+reusable even though the answer was negative.
+
+No private keys, no transactions, no smart contracts, no mempool, no bridge calls. Every
+number comes from historical on-chain state read through public archive RPC and block
+explorers.
 
 ---
 
-## 1. Purpose & The Kill Criterion
+## 1. The kill criterion
 
-Before writing any bot, smart contract, or deploying capital: on which chain and which debt size range do Aave V3 liquidations leave at least **300 EUR per month** of estimated net profit, in a market where **one liquidator does not take almost everything**? If none does, we stop.
+The pass/fail rule was fixed **before any data was collected**, which is the only way a
+go/no-go measurement means anything:
 
-This phase is strictly read-only. No keys, no transactions, no contracts, no mempool, and no external state modification.
+> Build a bot only for a niche that earns at least **300 EUR net per month in at least two
+> thirds of the months**, in a market where the **largest single competitor takes at most
+> 50%** of the profit.
 
----
-
-## 2. Scope & Chains
-
-### Supported Chains
-
-| Chain | Chain ID | Aave V3 Pool | Wrapped Native (Gas Pricing) |
-|---|---|---|---|
-| Arbitrum One | 42161 | `0x794a61358d6845594f94dc1db02a252b5b4814ad` | WETH `0x82af49447d8a07e3bd95bd0d56f35241523fbab1` |
-| Sonic | 146 | `0x5362dbb1e601abf3a4c14c22ffeda64042e5eaa3` | wS `0x039e2fb66102314ce7b64ce5ce3e5183bc94ad38` |
-
-At run start, each chain is verified on-chain to confirm that its wrapped-native token is registered in `Pool.getReservesList()`. If not, execution aborts with exit code 2.
-
-### Uncovered Chains (Out of Scope)
-
-- **Base** (`8453`): Etherscan V2 free tier refuses it (`status 0`, "Free API access is not supported for this chain"), and Alchemy free tier limits `eth_getLogs` to 10 blocks.
-- **Optimism** (`10`): Etherscan V2 free tier refuses it (`status 0`, "Free API access is not supported for this chain"), and Alchemy free tier limits `eth_getLogs` to 10 blocks.
-
-The census report explicitly lists both covered and uncovered chains.
+Everything below is measured against that rule.
 
 ---
 
-## 3. Installation & Setup
+## 2. What was measured, and what came out
 
-Requirements:
-- Python ≥ 3.11
-- `httpx`
+Measured September 2026. Full write-up of the reasoning: [`docs/FINDINGS.md`](docs/FINDINGS.md).
+
+### 2.1 Aave V3 liquidations — market exists, but it is a speed race
+
+Whole-market net profit (every bot combined), not what a newcomer would capture:
+
+| Chain | Window | Net, whole market | Liquidators | Top-1 share |
+|---|---|---|---|---|
+| Arbitrum One | 12 months | 2.77 M EUR | 276 | 27% |
+| Ethereum | 90 days | 882 k EUR | 103 | 42% |
+| Sonic | 12 months | 550 k EUR | 41 | 24% |
+| Base | 90 days | 52.9 k EUR | 64 | 22% |
+| Avalanche | 90 days | 40.4 k EUR | 27 | 39% |
+| Polygon | 90 days | 28.1 k EUR | 44 | 38% |
+| Optimism, Gnosis, Linea, zkSync, Scroll, Celo | 90 days | under 2 k EUR each | few | monopolised |
+
+- **The money is in crashes.** On Arbitrum the top 5 days of the year are 66% of the annual
+  profit; 10 October 2025 alone is 29%.
+- **Outside crashes** (crash days removed, debt ≥ $1,000), Arbitrum leaves roughly
+  **68,100 EUR per month for the entire market**, split across 87 active liquidators, median
+  $116 per liquidation.
+- Liquidations under $100 of debt are **net negative** after costs on every chain measured.
+- **Aave V4** (Ethereum, live since March 2026): 201 liquidations in five months, $98 k gross,
+  36 liquidators, top-1 41%, median bonus 4.49% — the Dutch auction does not produce large
+  bonuses in practice. On Arc (mainnet 16 September 2026): zero liquidations in the first
+  3.4 days. *Measured with an ad-hoc script against the V4 `Spoke` ABI, not with the CLI in
+  this repo — see [`docs/FINDINGS.md`](docs/FINDINGS.md).*
+
+### 2.2 Same-chain DEX arbitrage (Arbitrum, 90 days) — dead
+
+- 28,482 atomic arbitrages detected across Uniswap V3, SushiSwap V3 and PancakeSwap V3:
+  **$12,796 net in total**, median **$0.00**, p90 $0.08. About 70% of all profit comes from
+  15 transactions.
+- Independently cross-checked: across 85 sampled blocks over 7 days, **not one** round trip
+  was still profitable one block later.
+
+Competition has already ground this to cents.
+
+### 2.3 Cross-chain inventory arbitrage (Arbitrum / Base / Optimism, WETH/USDC) — real, but rare
+
+| Window | Opportunities | Still open after 5 min | Best single trade | Upper-bound total |
+|---|---|---|---|---|
+| Calm week | **0** of 1,026 evaluations | — | — | $0 |
+| Crash 10.10.2025 | 52 | 39 | $1,075 (Arbitrum→Base, $50 k, 2.2%) | ~$5,400 |
+| Crash 31.01.2026 | 11 | 5 | $1,613 (Base→Arbitrum, $50 k, 3.3%) | ~$1,660 |
+| Crash 05.02.2026 | 5 | 0 | $115 | ~$41 |
+| Crash 04.11.2025 | 0 | 0 | — | $0 |
+
+In a normal week the best round trip is negative *before* gas (−0.025% at best, typically
+−0.07%). This is the one mechanism measured where **opportunities last minutes rather than
+milliseconds**, so latency is not the binding constraint — but they appear only during
+crashes, only during *some* crashes, and they require $40 k–$200 k of inventory pre-positioned
+on both chains and exposed while it waits.
+
+### 2.4 Verdict
+
+**No niche passes the criterion.** Same-chain arbitrage is dead; liquidations are a speed
+race for scraps outside a handful of crash days; cross-chain gaps are real but too rare and
+too capital-hungry to clear 300 EUR in two thirds of months. The recommendation the data
+supports is to **not build the bot**.
+
+### A caveat that matters
+
+The CLI prints `PASS` for several of these markets. **That `PASS` only means the market is
+large enough and not monopolised — it is not a claim that a newcomer would capture any of
+it.** Capture depends on latency against incumbent bots, which this tool does not measure.
+Read every verdict in the report as a statement about the market, never about you.
+
+---
+
+## 3. What the tool does
+
+| Command group | Question it answers |
+|---|---|
+| `fetch` / `value` / `report` | Aave V3 liquidations on 12 chains: size, concentration, size buckets, verdict |
+| `arb-pools` / `arb-fetch` / `arb-census` | What DEX arbitrage bots actually earned, reconstructed from historical `Swap` logs (2A) |
+| `arb-sample` / `arb-report` | What was left on the table at sampled past blocks, quoted for real and tracked for persistence (2B) |
+| `xchain-sample` / `xchain-report` | Cross-chain inventory arbitrage across Arbitrum, Base and Optimism (2C) |
+
+Supported chains for the liquidation census: Arbitrum One (42161), Ethereum (1), Sonic (146),
+Base (8453), Optimism (10), Polygon (137), Avalanche (43114), Gnosis (100), Linea (59144),
+zkSync Era (324), Scroll (534352), Celo (42220). BNB Chain (56) is unsupported — no free log
+source was found for it.
+
+---
+
+## 4. Installation
+
+Requirements: Python ≥ 3.11.
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
+pytest -q
 ```
 
-### Environment Variables
+### Environment variables
 
-The CLI expects standard environment variables for Etherscan V2 and chain RPC endpoints:
-- `ETHERSCAN_API_KEY`: API key for Etherscan V2.
-- `MEVSCOUT_RPC_<CHAINID>`: JSON-RPC archive endpoint for each chain, e.g.:
-  - `MEVSCOUT_RPC_42161` for Arbitrum One
-  - `MEVSCOUT_RPC_146` for Sonic
+- `ETHERSCAN_API_KEY` — Etherscan V2 API key (log fetching).
+- `MEVSCOUT_RPC_<CHAINID>` — archive JSON-RPC endpoint per chain, e.g. `MEVSCOUT_RPC_42161`,
+  `MEVSCOUT_RPC_146`.
+- `MEVSCOUT_MAX_CPS` — client-side RPC pacing, calls per second (default 10, sized for a free
+  Alchemy tier).
 
-Sensitive API keys and URL paths are never printed or logged, and are redacted from all error messages.
+API keys and URL paths are never printed or logged, and are redacted from every error message.
+
+### Free-tier limits worth knowing before a long run
+
+- Alchemy's free tier allows roughly **10 calls/second** and only **10 blocks per
+  `eth_getLogs`**. Do not run two heavy jobs against the same key.
+- Etherscan V2's free tier **refuses Base, Optimism and BNB** (`status 0`, "Free API access is
+  not supported for this chain"); those chains fall back to Blockscout/Routescan.
+- Alchemy intermittently returns transient errors ("layer stale", 503) that must be retried.
+  Every sampler here persists per block and resumes, because one unretried error once cost a
+  109-minute run.
 
 ---
 
-## 4. Usage
-
-### 1. Fetch liquidation events
-
-Fetch historical `LiquidationCall` event logs from Etherscan V2 in chunks of at most 500,000 blocks and store them in SQLite:
+## 5. Quickstart
 
 ```bash
-mev-scout fetch --chain 42161 --days 90 [--db data/scout.db]
-mev-scout fetch --chain 146 --days 90 [--db data/scout.db]
+# Liquidation census: fetch, value, report
+mev-scout fetch  --chain 42161 --days 90 --db data/scout.db
+mev-scout value  --chain 42161 --db data/scout.db
+mev-scout report --chain 42161 --eurusd 1.17 --threshold-eur 300
+
+# Same-chain DEX arbitrage on Arbitrum
+mev-scout arb-pools  --chain 42161 --db data/scout.db
+mev-scout arb-fetch  --chain 42161 --days 90 --db data/scout.db
+mev-scout arb-census --chain 42161 --days 90 --eurusd 1.1460
+
+# Cross-chain, during a crash window
+mev-scout xchain-sample --days 1 --every-min 10 --db data/xcrash.db
+mev-scout xchain-report --eurusd 1.1460 --db data/xcrash.db
 ```
 
-### 2. Value liquidations
-
-Compute historical valuations for all stored liquidations using on-chain Aave V3 price oracles at each event's block number:
-
-```bash
-mev-scout value --chain 42161 [--db data/scout.db] [--swap-cost 0.003] [--flash-fee 0.0005]
-mev-scout value --chain 146 [--db data/scout.db] [--swap-cost 0.003] [--flash-fee 0.0005]
-```
-
-Every `eth_call` result is cached locally in SQLite `call_cache` keyed by `(chain, to, data, block)`.
-
-### 3. Generate census report
-
-Verify coverage without gaps, run sampled receipt validation, compute concentration metrics, and output the verdict:
-
-```bash
-# Text report to stdout
-mev-scout report --chain 42161 --chain 146 --eurusd 1.17 [--threshold-eur 300] [--days 90]
-
-# Machine-readable JSON output
-mev-scout report --chain 42161 --chain 146 --eurusd 1.17 --json
-
-# Export events CSV
-mev-scout report --chain 42161 --chain 146 --eurusd 1.17 --csv data/events.csv
-```
-
-Exit codes:
-- `0`: Report produced successfully.
-- `2`: Configuration, data-source, or coverage error.
+Exit codes: `0` report produced, `2` configuration, data-source or coverage error.
 
 ---
-
-## 5. How Numbers Are Computed
+## 6. Reference: how the liquidation numbers are computed
 
 All raw token math is performed using exact integer arithmetic. Valuation into money is performed strictly using `Decimal` (never floating-point).
 
@@ -133,8 +203,7 @@ For each event at its block `b`:
    - **FAIL**: Otherwise, with the failing condition(s) explicitly named.
 
 ---
-
-## 6. Sampled Tie-Out Validation
+## 7. Reference: sampled tie-out validation
 
 For a deterministic sample of up to 20 events per chain (fixed seed), the transaction receipt is fetched from the archive RPC to verify:
 1. `receipt.gasUsed × receipt.effectiveGasPrice` matches the log's `gasUsed × gasPrice`.
@@ -144,7 +213,7 @@ Any disagreement is displayed as a `WARNING` banner at the top of the report.
 
 ---
 
-## 7. Phase 2: DEX Arbitrage Census (Arbitrum One)
+## 8. Reference: Phase 2 — DEX Arbitrage Census (Arbitrum One)
 
 Phase 2 investigates DEX-to-DEX arbitrage on Arbitrum One (`chain_id 42161`) across Uniswap V3, SushiSwap V3, and PancakeSwap V3 across two complementary measurements:
 - **2A — What bots actually earned**: Reconstruct past atomic arbitrage transactions from historical `Swap` logs.
@@ -197,7 +266,7 @@ mev-scout arb-report --chain 42161 --eurusd 1.1460 [--threshold-eur 300] [--days
 
 ---
 
-## 8. Phase 2C: Cross-Chain Inventory Arbitrage (Arbitrum, Base, Optimism)
+## 9. Reference: Phase 2C — Cross-Chain Inventory Arbitrage (Arbitrum, Base, Optimism)
 
 Phase 2C censuses cross-chain inventory arbitrage opportunities between Arbitrum One (`42161`), Base (`8453`), and Optimism (`10`) for the WETH/USDC pair.
 
@@ -239,10 +308,55 @@ mev-scout xchain-report --eurusd 1.1460 [--threshold-eur 300] [--days 30] [--jso
 
 ---
 
-## 9. Limitations & Non-Goals
+## 10. What the live runs found that a green test suite did not
 
-- **Phase 1 Scope**: Strictly observational liquidation census for Aave V3 on Arbitrum One and Sonic.
-- **Phase 2 Scope**: Strictly observational atomic DEX arbitrage on Arbitrum One (2A/2B), and cross-chain inventory arbitrage across Arbitrum, Base, and Optimism (2C).
-- **No Active Execution**: No private keys, no trade execution, no bridge calls, no mempool listeners, no CEX data.
-- **Upper Bound Nature**: The report explicitly states that results represent an upper bound of potential earnings: live execution introduces latency, partial fills, gas bidding competition, and inter-leg price risk.
-- **RPC & Error Discipline**: Transport errors propagate; only `ContractCallError` reverts are skipped and counted; missing data is marked unpriced and counted.
+Every bug below passed the offline test suite and was caught only by running against real
+chains. They are listed because they are the failure modes of *any* on-chain measurement
+code, not because they are unique to this project.
+
+- **Silent guesses instead of failures.** A hardcoded `WETH = $2,600` fallback, `decimals`
+  defaulting to 18, gas silently set to 0 on a missing receipt field, and a substituted base
+  fee of 0.1 gwei when the real one was 0. Each produced a plausible number from no data.
+  Fixed by marking values `unpriced`, counting them, and excluding them from totals — a
+  missing price is never zero.
+- **Network errors counted as data.** Broad `except` blocks turned RPC outages into "no
+  opportunity found" and transport errors into dropped pools. Only genuine contract reverts
+  are skipped now, and they are counted; every transport error propagates or retries.
+- **Reports produced from zero data.** A report over an empty sample still rendered a verdict.
+  The reporters now refuse to emit a verdict when nothing was sampled.
+- **A verdict that bypassed its own rule.** The 2C verdict was fed one averaged month, which
+  would have let a single crash pass the "two thirds of months" criterion. Fixed to evaluate
+  real 30-day months.
+- **Invented contract addresses.** An agent handed a truncated address in a spec
+  (`0xb4cb8009…`) completed it with plausible invented characters; every chain pair was then
+  skipped silently rather than erroring. Never pass truncated addresses to anything.
+- **Shallow pools quote absurdly without erroring.** A Sushi 0.01% pool quoted 1 WETH → 9.14
+  USDC against a real price near $2,648. Mid-price comparison alone manufactures opportunities;
+  every candidate pool is now depth-checked (10× size must quote within 2% of 1× price).
+- **A wrong event topic drops data in silence.** PancakeSwap's `Swap` event carries two extra
+  protocol-fee parameters and therefore a different `topic0`; filtering by the Uniswap topic
+  silently discards every PancakeSwap swap.
+
+---
+
+## 11. Limitations & non-goals
+
+- **Observational only**: a liquidation census for Aave V3 across 12 chains, atomic DEX arbitrage on Arbitrum One (2A/2B), and cross-chain inventory arbitrage across Arbitrum, Base and Optimism (2C). Nothing here trades.
+- **Protocol coverage**: Aave V3 only. Aave V4 was measured separately with an ad-hoc script and is not supported by this CLI.
+- **Venue coverage**: Uniswap V3, SushiSwap V3 and PancakeSwap V3 (plus Aerodrome/Velodrome Slipstream venues on Base and Optimism for 2C). Camelot, Uniswap V4, Balancer and others are not tracked, so same-chain arbitrage figures are a lower bound.
+- **Market, not capture**: a `PASS` verdict means the market is large enough and not monopolised. It is not a measurement of what a newcomer would win — that depends on latency against incumbent bots, which this tool does not measure.
+- **No active execution**: no private keys, no trade execution, no bridge calls, no mempool listeners, no CEX data.
+- **Upper bound**: reports state explicitly that results are an upper bound on potential earnings. Live execution adds latency, partial fills, gas-bidding competition and inter-leg price risk.
+- **RPC and error discipline**: transport errors propagate or retry; only `ContractCallError` reverts are skipped, and they are counted; missing data is marked `unpriced` and counted, never treated as zero.
+
+---
+
+## 12. Status and licence
+
+The measurement programme is complete and the project is **archived as a research tool**:
+the question it was built to answer has been answered. Issues and forks are welcome; no
+roadmap is planned. The one extension that would still add information is a live watch
+during the next crash — recording, with no capital at risk, whether a newcomer could have
+captured anything — sketched in [`docs/PHASE3-live-observatory.md`](docs/PHASE3-live-observatory.md).
+
+Licensed under the MIT Licence; see [`LICENSE`](LICENSE).
