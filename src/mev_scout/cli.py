@@ -280,6 +280,77 @@ def arb_report_cmd(
         store.close()
 
 
+def xchain_sample_cmd(
+    days: int,
+    every_min: int,
+    dense: list[str] | None,
+    rebalance_pct: Decimal,
+    rebalance_fixed_usd: Decimal,
+    db_path: str,
+) -> None:
+    from mev_scout.xchain import run_xchain_sample
+
+    rpcs = {}
+    with httpx.Client(timeout=30.0) as http:
+        for cid in (42161, 8453, 10):
+            rpc_env = f"MEVSCOUT_RPC_{cid}"
+            rpc_url = os.environ.get(rpc_env)
+            if not rpc_url:
+                raise ConfigError(f"{rpc_env} environment variable is required")
+            rpcs[cid] = RpcClient(url=rpc_url, http=http, max_calls_per_sec=_max_cps())
+
+        store = Store(db_path)
+        try:
+            run_xchain_sample(
+                rpcs=rpcs,
+                store=store,
+                days=days,
+                every_min=every_min,
+                dense_ranges=dense,
+                rebalance_pct=rebalance_pct,
+                rebalance_fixed_usd=rebalance_fixed_usd,
+                progress_stream=sys.stderr,
+            )
+        finally:
+            store.close()
+
+
+def xchain_report_cmd(
+    eurusd: Decimal,
+    threshold_eur: Decimal,
+    days: int,
+    db_path: str,
+    as_json: bool = False,
+    csv_path: str | None = None,
+) -> str:
+    from mev_scout.xchain import generate_xchain_report
+
+    store = Store(db_path)
+    try:
+        opps = store.get_xchain_opportunities()
+        completed = store.get_completed_xchain_moments()
+        total_moments = len(completed) if completed else (len({o.moment for o in opps}) if opps else 0)
+        from_ts = min((o.moment for o in opps), default=0)
+        to_ts = max((o.moment for o in opps), default=0)
+        rep = generate_xchain_report(
+            opportunities=opps,
+            total_moments=total_moments,
+            days=days,
+            eurusd=eurusd,
+            threshold_eur=threshold_eur,
+            from_ts=from_ts,
+            to_ts=to_ts,
+        )
+        if csv_path:
+            with open(csv_path, "w", encoding="utf-8") as f:
+                f.write(rep.to_csv())
+        if as_json:
+            return rep.to_json()
+        return rep.to_text()
+    finally:
+        store.close()
+
+
 def report_cmd(
     chain_ids: list[int],
     eurusd: Decimal,
@@ -450,6 +521,24 @@ def main(argv=None) -> None:
     p_arb_report.add_argument("--db", default="data/scout.db", help="SQLite DB path (default: data/scout.db)")
     p_arb_report.add_argument("--json", action="store_true", help="Output JSON format")
 
+    # xchain-sample
+    p_xchain_sample = subparsers.add_parser("xchain-sample", help="Sample cross-chain inventory arbitrage opportunities")
+    p_xchain_sample.add_argument("--days", type=int, default=30, help="Window length in days (default: 30)")
+    p_xchain_sample.add_argument("--every-min", type=int, default=5, help="Sampling interval in minutes (default: 5)")
+    p_xchain_sample.add_argument("--dense", action="append", help="Dense timestamp range FROM:TO (can repeat)")
+    p_xchain_sample.add_argument("--rebalance-pct", type=Decimal, default=Decimal("0.0005"), help="Rebalance cost pct (default: 0.0005)")
+    p_xchain_sample.add_argument("--rebalance-fixed-usd", type=Decimal, default=Decimal("1.00"), help="Rebalance fixed cost USD (default: 1.00)")
+    p_xchain_sample.add_argument("--db", default="data/scout.db", help="SQLite DB path (default: data/scout.db)")
+
+    # xchain-report
+    p_xchain_report = subparsers.add_parser("xchain-report", help="Report cross-chain inventory arbitrage opportunities")
+    p_xchain_report.add_argument("--eurusd", type=Decimal, required=True, help="EUR/USD exchange rate")
+    p_xchain_report.add_argument("--threshold-eur", type=Decimal, default=Decimal("300"), help="Monthly threshold in EUR (default: 300)")
+    p_xchain_report.add_argument("--days", type=int, default=30, help="Window length in days (default: 30)")
+    p_xchain_report.add_argument("--db", default="data/scout.db", help="SQLite DB path (default: data/scout.db)")
+    p_xchain_report.add_argument("--json", action="store_true", help="Output JSON format")
+    p_xchain_report.add_argument("--csv", help="Optional path to output opportunities CSV")
+
     args = parser.parse_args(argv)
 
     try:
@@ -520,6 +609,29 @@ def main(argv=None) -> None:
                 days=args.days,
                 db_path=args.db,
                 as_json=args.json,
+            )
+            print(output)
+            sys.exit(0)
+
+        elif args.command == "xchain-sample":
+            xchain_sample_cmd(
+                days=args.days,
+                every_min=args.every_min,
+                dense=args.dense,
+                rebalance_pct=args.rebalance_pct,
+                rebalance_fixed_usd=args.rebalance_fixed_usd,
+                db_path=args.db,
+            )
+            sys.exit(0)
+
+        elif args.command == "xchain-report":
+            output = xchain_report_cmd(
+                eurusd=args.eurusd,
+                threshold_eur=args.threshold_eur,
+                days=args.days,
+                db_path=args.db,
+                as_json=args.json,
+                csv_path=args.csv,
             )
             print(output)
             sys.exit(0)
