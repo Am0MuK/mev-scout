@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from typing import Any
 
+from mev_scout.hexint import parse_int
+
 LIQUIDATION_TOPIC0 = "0xe413a321e8681d831f4dbccbca790d2952b56f977908e45be37335533e005286"
 
 
@@ -46,12 +48,12 @@ def decode_log(chain_id: int, row: dict[str, Any]) -> Liquidation:
     liquidator = "0x" + clean_data[128:192][-40:].lower()
     receive_atoken = bool(int(clean_data[192:256], 16))
 
-    block = int(str(row["blockNumber"]), 0)
-    timestamp = int(str(row["timeStamp"]), 0)
+    block = parse_int(row["blockNumber"])
+    timestamp = parse_int(row["timeStamp"])
     tx_hash = str(row["transactionHash"]).lower()
-    log_index = int(str(row["logIndex"]), 0)
-    gas_used = int(str(row["gasUsed"]), 0)
-    gas_price = int(str(row["gasPrice"]), 0)
+    log_index = parse_int(row["logIndex"])
+    gas_used = parse_int(row["gasUsed"])
+    gas_price = parse_int(row["gasPrice"])
 
     return Liquidation(
         chain_id=chain_id,

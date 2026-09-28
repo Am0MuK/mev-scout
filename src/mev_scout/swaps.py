@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from typing import Any
 
+from mev_scout.hexint import parse_int
+
 UNISWAP_SWAP_TOPIC0 = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
 PANCAKESWAP_SWAP_TOPIC0 = "0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83"
 
@@ -81,10 +83,10 @@ def decode_swap_log(chain_id: int, row: dict[str, Any], dex: str | None = None) 
         protocol_fees_token1 = int(clean_data[384:448], 16)
 
     pool = str(row.get("address", "")).lower()
-    block = int(str(row["blockNumber"]), 0)
-    timestamp = int(str(row["timeStamp"]), 0)
+    block = parse_int(row["blockNumber"])
+    timestamp = parse_int(row["timeStamp"])
     tx_hash = str(row["transactionHash"]).lower()
-    log_index = int(str(row["logIndex"]), 0)
+    log_index = parse_int(row["logIndex"])
 
     return DecodedSwap(
         chain_id=chain_id,

@@ -81,3 +81,16 @@ def test_decode_malformed_data_length_raises_value_error():
     }
     with pytest.raises(ValueError, match="data length"):
         decode_log(1, row)
+
+
+def test_decode_accepts_0x_for_zero_fields():
+    # Etherscan encodes zero as a bare "0x": logIndex 0, gasPrice 0.
+    fixture_path = Path(__file__).parent / "fixtures" / "sonic_liquidation_block_50060028.json"
+    with open(fixture_path) as f:
+        row = dict(json.load(f)["result"][0])
+    row["logIndex"] = "0x"
+    row["gasPrice"] = "0x"
+
+    event = decode_log(146, row)
+    assert event.log_index == 0
+    assert event.gas_price == 0

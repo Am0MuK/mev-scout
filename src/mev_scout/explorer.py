@@ -7,6 +7,7 @@ from typing import Any
 import httpx
 
 from mev_scout.chains import ChainConfig, ConfigError
+from mev_scout.hexint import parse_int
 
 PAGE_SIZE = 1000
 MAX_PAGES = 10_000 // PAGE_SIZE  # 10
@@ -36,7 +37,7 @@ def _check_page(page: list[dict], from_block: int, to_block: int) -> None:
     """Pagination relies on rows in ascending block order inside the range."""
     previous = from_block
     for r in page:
-        block = int(str(r["blockNumber"]), 0)
+        block = parse_int(r["blockNumber"])
         if not from_block <= block <= to_block:
             raise ExplorerError(f"log in block {block} is outside the requested range {from_block}-{to_block}")
         if block < previous:
@@ -187,8 +188,8 @@ class EtherscanClient(LogSource):
                 all_rows.extend(page)
                 break
 
-            first_block = int(str(page[0]["blockNumber"]), 0)
-            last_block = int(str(page[-1]["blockNumber"]), 0)
+            first_block = parse_int(page[0]["blockNumber"])
+            last_block = parse_int(page[-1]["blockNumber"])
 
             if first_block == last_block:
                 single_rows = self._fetch_single_block(chain_id, address, topic0, last_block)
@@ -198,12 +199,12 @@ class EtherscanClient(LogSource):
                 start_block = last_block + 1
                 continue
 
-            all_rows.extend(r for r in page if int(str(r["blockNumber"]), 0) != last_block)
+            all_rows.extend(r for r in page if parse_int(r["blockNumber"]) != last_block)
             start_block = last_block
 
         seen = set()
         for r in all_rows:
-            key = (r["transactionHash"].lower(), int(str(r["logIndex"]), 0))
+            key = (r["transactionHash"].lower(), parse_int(r["logIndex"]))
             if key in seen:
                 raise ExplorerError(f"Duplicate log entry detected: tx={r['transactionHash']} logIndex={r['logIndex']}")
             seen.add(key)
@@ -374,8 +375,8 @@ class BlockscoutClient(LogSource):
                 start_block = target_to + 1
                 continue
 
-            first_block = int(str(page[0]["blockNumber"]), 0)
-            last_block = int(str(page[-1]["blockNumber"]), 0)
+            first_block = parse_int(page[0]["blockNumber"])
+            last_block = parse_int(page[-1]["blockNumber"])
 
             if first_block == last_block:
                 single_rows = self._fetch_single_block(chain_id, address, topic0, last_block)
@@ -385,12 +386,12 @@ class BlockscoutClient(LogSource):
                 start_block = last_block + 1
                 continue
 
-            all_rows.extend(r for r in page if int(str(r["blockNumber"]), 0) != last_block)
+            all_rows.extend(r for r in page if parse_int(r["blockNumber"]) != last_block)
             start_block = last_block
 
         seen = set()
         for r in all_rows:
-            key = (r["transactionHash"].lower(), int(str(r["logIndex"]), 0))
+            key = (r["transactionHash"].lower(), parse_int(r["logIndex"]))
             if key in seen:
                 raise ExplorerError(f"Duplicate log entry detected: tx={r['transactionHash']} logIndex={r['logIndex']}")
             seen.add(key)
@@ -416,7 +417,7 @@ class BlockscoutClient(LogSource):
                 raise ExplorerError(f"Expected list of logs, got {type(page)}")
 
             # Detect repeated page
-            curr_keys = {(r["transactionHash"].lower(), int(str(r["logIndex"]), 0)) for r in page}
+            curr_keys = {(r["transactionHash"].lower(), parse_int(r["logIndex"])) for r in page}
             if prev_page_keys is not None and curr_keys == prev_page_keys:
                 raise ExplorerError(
                     f"Repeated page detected in single-block pagination at block {block}: "

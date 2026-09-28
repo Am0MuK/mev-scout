@@ -271,3 +271,34 @@ def test_dropped_connection_is_retried():
     client = EtherscanClient(api_key="KEY", http=httpx.Client(transport=httpx.MockTransport(handler)), sleep=lambda s: None)
     assert client.get_logs(1, "0xpool", "0xtopic", 1, 10) == []
     assert calls["n"] == 3
+
+
+def test_get_logs_accepts_0x_for_log_index_zero():
+    # Etherscan encodes zero as a bare "0x" (seen on Arbitrum Burn logs, 2026-09-28).
+    rows = [
+        {"blockNumber": "0xa", "transactionHash": "0xabc", "logIndex": "0x"},
+        {"blockNumber": "0xa", "transactionHash": "0xabc", "logIndex": "0x1"},
+    ]
+    assert _client([rows]).get_logs(1, "0xpool", "0xtopic", 10, 20) == rows
+
+
+def test_get_logs_0x_log_index_still_detects_duplicates():
+    rows = [
+        {"blockNumber": "0xa", "transactionHash": "0xabc", "logIndex": "0x"},
+        {"blockNumber": "0xa", "transactionHash": "0xabc", "logIndex": "0x0"},
+    ]
+    with pytest.raises(ExplorerError, match="[Dd]uplicate"):
+        _client([rows]).get_logs(1, "0xpool", "0xtopic", 10, 20)
+
+
+def test_parse_int_handles_explorer_encodings():
+    from mev_scout.hexint import parse_int
+
+    assert parse_int("0x") == 0
+    assert parse_int("0X") == 0
+    assert parse_int("0x1f") == 31
+    assert parse_int("46807524") == 46807524
+    assert parse_int(7) == 7
+    for bad in ("", None, "abc"):
+        with pytest.raises(ValueError):
+            parse_int(bad)

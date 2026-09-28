@@ -143,3 +143,12 @@ def test_decode_invalid_topics_or_length():
     }
     with pytest.raises(ValueError, match="Invalid data length"):
         decode_swap_log(42161, row_bad_len)
+
+
+def test_decode_swap_accepts_0x_for_log_index_zero():
+    # Etherscan encodes logIndex 0 as a bare "0x".
+    with open(FIXTURES_DIR / "uniswap_v3_weth_usdc_500_swaps.json") as f:
+        row = dict(json.load(f)["result"][0])
+    row["logIndex"] = "0x"
+
+    assert decode_swap_log(chain_id=42161, row=row, dex="uniswap_v3").log_index == 0
